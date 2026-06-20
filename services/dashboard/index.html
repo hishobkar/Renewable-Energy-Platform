@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Smart Renewable Energy Platform</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --text:     #e6edf3;
+      --muted:    #8b949e;
+      --green:    #3fb950;
+      --yellow:   #d29922;
+      --orange:   #e3650d;
+      --red:      #f85149;
+      --blue:     #58a6ff;
+      --purple:   #bc8cff;
+      --teal:     #39d353;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px; line-height: 1.5; min-height: 100vh;
+    }
+    /* ── Layout ── */
+    .header {
+      background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px;
+      display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100;
+    }
+    .header h1 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+    .header h1 .icon { font-size: 22px; }
+    .status-bar { display: flex; gap: 16px; align-items: center; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+    .main { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 53px); }
+    .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 16px; overflow-y: auto; }
+    .content { padding: 20px; overflow-y: auto; }
+    /* ── Tabs ── */
+    .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+    .tab { padding: 8px 16px; cursor: pointer; border: none; background: none; color: var(--muted); font-size: 14px;
+           border-bottom: 2px solid transparent; margin-bottom: -1px; transition: .2s; }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    /* ── Cards ── */
+    .grid { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 8px; }
+    .card .value { font-size: 28px; font-weight: 700; }
+    .card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .stat-green { color: var(--green); }
+    .stat-yellow { color: var(--yellow); }
+    .stat-orange { color: var(--orange); }
+    .stat-red { color: var(--red); }
+    /* ── Asset list ── */
+    .asset-item {
+      padding: 10px 12px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 10px;
+      margin-bottom: 4px; transition: background .15s; border: 1px solid transparent;
+    }
+    .asset-item:hover { background: rgba(255,255,255,.04); }
+    .asset-item.selected { background: rgba(88,166,255,.1); border-color: rgba(88,166,255,.3); }
+    .asset-icon { font-size: 20px; width: 28px; text-align: center; }
+    .asset-info .name { font-weight: 500; font-size: 13px; }
+    .asset-info .type { font-size: 11px; color: var(--muted); }
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 12px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+    }
+    .badge-active   { background: rgba(63,185,80,.15); color: var(--green); }
+    .badge-maintenance { background: rgba(210,153,34,.15); color: var(--yellow); }
+    .badge-fault    { background: rgba(248,81,73,.15);  color: var(--red); }
+    .badge-inactive { background: rgba(139,148,158,.15); color: var(--muted); }
+    .badge-critical { background: rgba(248,81,73,.15);  color: var(--red); }
+    .badge-high     { background: rgba(227,101,13,.15); color: var(--orange); }
+    .badge-medium   { background: rgba(210,153,34,.15); color: var(--yellow); }
+    .badge-low      { background: rgba(88,166,255,.15); color: var(--blue); }
+    /* ── Table ── */
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing:.05em;
+         color: var(--muted); border-bottom: 1px solid var(--border); }
+    td { padding: 10px 12px; border-bottom: 1px solid rgba(48,54,61,.5); vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,.02); }
+    /* ── Chart ── */
+    .chart-wrap { position: relative; height: 220px; }
+    /* ── Telemetry panel ── */
+    .metric-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0;
+                  border-bottom: 1px solid rgba(48,54,61,.5); }
+    .metric-row:last-child { border-bottom: none; }
+    .metric-name { color: var(--muted); font-size: 12px; text-transform: capitalize; }
+    .metric-val { font-weight: 600; font-size: 15px; }
+    .progress-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-top: 4px; }
+    .progress-fill { height: 100%; border-radius: 2px; transition: width .5s; }
+    /* ── Misc ── */
+    .empty { text-align: center; padding: 40px; color: var(--muted); }
+    .refresh { background: none; border: 1px solid var(--border); color: var(--text); padding: 5px 14px;
+               border-radius: 6px; cursor: pointer; font-size: 13px; transition: .2s; }
+    .refresh:hover { background: rgba(255,255,255,.05); }
+    .section-title { font-size: 16px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+    .sidebar-title { font-size: 11px; text-transform: uppercase; letter-spacing:.08em; color: var(--muted);
+                     margin-bottom: 10px; margin-top: 16px; }
+    .sidebar-title:first-child { margin-top: 0; }
+    .log-item { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,.4); font-size: 12px; }
+    .log-item .ts { color: var(--muted); font-size: 11px; }
+    .log-item .msg { margin-top: 2px; }
+    .chip { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; background: rgba(88,166,255,.15); color: var(--blue); }
+  </style>
+</head>
+<body>
+<header class="header">
+  <h1><span class="icon">⚡</span> Smart Renewable Energy Platform</h1>
+  <div class="status-bar">
+    <div class="status-dot"></div>
+    <span id="live-clock" style="color:var(--muted);font-size:12px;"></span>
+    <button class="refresh" onclick="refreshAll()">↻ Refresh</button>
+  </div>
+</header>
+
+<div class="main">
+  <!-- ─── Sidebar ─────────────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sidebar-title">Assets</div>
+    <div id="asset-list">
+      <div class="empty" style="padding:20px;font-size:12px;">Loading assets…</div>
+    </div>
+
+    <div class="sidebar-title" style="margin-top:24px;">Live Events</div>
+    <div id="event-log" style="max-height:300px;overflow-y:auto;"></div>
+  </aside>
+
+  <!-- ─── Main Content ──────────────────────────────────────────────────── -->
+  <main class="content">
+    <div class="tabs">
+      <button class="tab active" onclick="showTab('overview')">Overview</button>
+      <button class="tab" onclick="showTab('telemetry')">Telemetry</button>
+      <button class="tab" onclick="showTab('anomalies')">Anomalies</button>
+      <button class="tab" onclick="showTab('alerts')">Alerts</button>
+    </div>
+
+    <!-- Overview Tab -->
+    <div id="tab-overview" class="tab-panel active">
+      <div class="grid grid-4" style="margin-bottom:20px;">
+        <div class="card"><h3>Total Assets</h3><div class="value stat-blue" id="stat-total">–</div><div class="sub">registered</div></div>
+        <div class="card"><h3>Active</h3><div class="value stat-green" id="stat-active">–</div><div class="sub">operational</div></div>
+        <div class="card"><h3>In Maintenance</h3><div class="value stat-yellow" id="stat-maint">–</div><div class="sub">scheduled</div></div>
+        <div class="card"><h3>Open Alerts</h3><div class="value stat-red" id="stat-alerts">–</div><div class="sub">requires attention</div></div>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <div class="section-title">Assets Overview</div>
+          <div class="chart-wrap"><canvas id="asset-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="section-title">Alert Severity Distribution</div>
+          <div class="chart-wrap"><canvas id="alert-chart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="section-title">All Assets</div>
+        <table>
+          <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Capacity</th><th>Location</th><th>Last Maintenance</th></tr></thead>
+          <tbody id="assets-table-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Telemetry Tab -->
+    <div id="tab-telemetry" class="tab-panel">
+      <div id="telemetry-header" class="section-title">
+        Select an asset to view live telemetry
+      </div>
+      <div id="telemetry-content">
+        <div class="card" style="margin-bottom:16px;">
+          <div class="chart-wrap"><canvas id="telemetry-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="section-title">Current Readings</div>
+          <div id="metric-grid"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Anomalies Tab -->
+    <div id="tab-anomalies" class="tab-panel">
+      <div class="card">
+        <div class="section-title">Detected Anomalies</div>
+        <table>
+          <thead><tr><th>Time</th><th>Asset</th><th>Metric</th><th>Value</th><th>Severity</th><th>Recommendation</th></tr></thead>
+          <tbody id="anomalies-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Alerts Tab -->
+    <div id="tab-alerts" class="tab-panel">
+      <div class="card">
+        <div class="section-title">Active Alerts</div>
+        <table>
+          <thead><tr><th>Time</th><th>Asset</th><th>Metric</th><th>Value</th><th>Severity</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody id="alerts-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+// ─── Config ──────────────────────────────────────────────────────────────────
+const API = {
+  asset:    'http://localhost:5001',
+  telemetry:'http://localhost:5002',
+  anomaly:  'http://localhost:5003',
+  alert:    'http://localhost:5004',
+};
+
+// ─── State ───────────────────────────────────────────────────────────────────
+let state = {
+  assets: [],
+  telemetry: [],
+  anomalies: [],
+  alerts: [],
+  selectedAsset: null,
+  telChart: null,
+  telData: {},   // asset_id → [{ts, metrics}]
+};
+
+const ASSET_ICONS = { WindTurbine:'🌀', SolarFarm:'☀️', HydroElectric:'💧', BatteryStorage:'🔋' };
+const METRIC_UNITS = {
+  temperature:'°C', vibration:'mm/s', power_output:'MW', wind_speed:'m/s',
+  rotor_speed:'rpm', solar_irr:'W/m²', voltage:'V', current:'A',
+  state_of_charge:'%', flow_rate:'m³/s', head_pressure:'m',
+};
+
+// ─── Fetch helpers ────────────────────────────────────────────────────────────
+async function apiFetch(url, opts={}) {
+  try {
+    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch(e) {
+    return null;
+  }
+}
+
+// ─── Tab switching ────────────────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.tab, .tab-panel').forEach(el => el.classList.remove('active'));
+  document.querySelector(`.tab[onclick="showTab('${name}')"]`).classList.add('active');
+  document.getElementById(`tab-${name}`).classList.add('active');
+  if (name === 'telemetry' && state.selectedAsset) loadTelemetry(state.selectedAsset);
+  if (name === 'anomalies') loadAnomalies();
+  if (name === 'alerts') loadAlerts();
+}
+
+// ─── Clock ────────────────────────────────────────────────────────────────────
+function updateClock() {
+  document.getElementById('live-clock').textContent = new Date().toLocaleTimeString();
+}
+setInterval(updateClock, 1000); updateClock();
+
+// ─── Assets ───────────────────────────────────────────────────────────────────
+async function loadAssets() {
+  const data = await apiFetch(`${API.asset}/api/v1/assets`);
+  if (!data) { logEvent('⚠️', 'Asset Service unreachable'); return; }
+  state.assets = Array.isArray(data) ? data : (data.assets || data.items || []);
+
+  renderAssetList();
+  renderAssetsTable();
+  updateStatsCards();
+  renderAssetChart();
+}
+
+function renderAssetList() {
+  const el = document.getElementById('asset-list');
+  if (!state.assets.length) { el.innerHTML = '<div class="empty" style="padding:16px;font-size:12px;">No assets found</div>'; return; }
+  el.innerHTML = state.assets.map(a => `
+    <div class="asset-item ${state.selectedAsset?.id===a.id?'selected':''}" onclick="selectAsset('${a.id}')">
+      <span class="asset-icon">${ASSET_ICONS[a.type]||'⚡'}</span>
+      <div class="asset-info">
+        <div class="name">${a.name}</div>
+        <div class="type">${a.type}</div>
+      </div>
+      <span class="badge badge-${a.status?.toLowerCase()}">${a.status}</span>
+    </div>`).join('');
+}
+
+function renderAssetsTable() {
+  const tb = document.getElementById('assets-table-body');
+  if (!state.assets.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No assets</td></tr>'; return; }
+  tb.innerHTML = state.assets.map(a => `
+    <tr onclick="selectAssetAndTab('${a.id}')" style="cursor:pointer;">
+      <td><strong>${a.name}</strong></td>
+      <td>${ASSET_ICONS[a.type]||''} ${a.type}</td>
+      <td><span class="badge badge-${a.status?.toLowerCase()}">${a.status}</span></td>
+      <td>${a.capacityMW ?? a.CapacityMW ?? '–'} MW</td>
+      <td>${(a.latitude??a.Latitude)?.toFixed(3)||'–'}, ${(a.longitude??a.Longitude)?.toFixed(3)||'–'}</td>
+      <td>${a.lastMaintenanceDate ? new Date(a.lastMaintenanceDate).toLocaleDateString() : 'Never'}</td>
+    </tr>`).join('');
+}
+
+function updateStatsCards() {
+  const s = state.assets;
+  document.getElementById('stat-total').textContent = s.length;
+  document.getElementById('stat-active').textContent = s.filter(a=>a.status==='Active').length;
+  document.getElementById('stat-maint').textContent = s.filter(a=>a.status==='Maintenance').length;
+}
+
+function selectAsset(id) {
+  state.selectedAsset = state.assets.find(a => a.id === id);
+  renderAssetList();
+  loadTelemetry(state.selectedAsset);
+  document.getElementById('telemetry-header').textContent = `Live Telemetry – ${state.selectedAsset?.name}`;
+}
+
+function selectAssetAndTab(id) { selectAsset(id); showTab('telemetry'); }
+
+// ─── Asset chart ──────────────────────────────────────────────────────────────
+let assetChartInst = null;
+function renderAssetChart() {
+  const counts = {};
+  state.assets.forEach(a => { counts[a.type] = (counts[a.type]||0)+1; });
+  const labels = Object.keys(counts); const vals = Object.values(counts);
+  const ctx = document.getElementById('asset-chart');
+  if (assetChartInst) assetChartInst.destroy();
+  assetChartInst = new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels, datasets:[{ data:vals, backgroundColor:['#58a6ff','#3fb950','#d29922','#bc8cff'], borderWidth:0 }] },
+    options: { plugins:{ legend:{ labels:{ color:'#8b949e', font:{size:12} } } }, cutout:'65%' }
+  });
+}
+
+// ─── Telemetry ────────────────────────────────────────────────────────────────
+let telChartInst = null;
+const CHART_HISTORY = 20;
+
+async function loadTelemetry(asset) {
+  if (!asset) return;
+  const data = await apiFetch(`${API.telemetry}/api/v1/telemetry/${asset.id}?limit=50`);
+  if (!data) { logEvent('⚠️', 'Telemetry Service unreachable'); return; }
+
+  const records = (data.records || []).reverse().slice(-CHART_HISTORY);
+  if (!records.length) { document.getElementById('metric-grid').innerHTML = '<div class="empty">No telemetry yet – simulator may still be warming up.</div>'; return; }
+
+  const latest = records[records.length - 1];
+  renderMetricGrid(latest.metrics || {});
+  renderTelemetryChart(records, asset.type);
+}
+
+function renderMetricGrid(metrics) {
+  const maxes = { temperature:80, vibration:5, power_output:100, wind_speed:25, rotor_speed:20,
+                  solar_irr:1200, voltage:250, current:500, state_of_charge:100, flow_rate:200, head_pressure:60 };
+  const el = document.getElementById('metric-grid');
+  el.innerHTML = Object.entries(metrics).map(([k,v]) => {
+    const pct = maxes[k] ? Math.min(100, (v/maxes[k])*100) : 50;
+    const color = pct>80?'var(--red)':pct>60?'var(--yellow)':'var(--green)';
+    return `<div class="metric-row">
+      <div><div class="metric-name">${k.replace(/_/g,' ')}</div>
+        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
+      </div>
+      <div class="metric-val">${parseFloat(v).toFixed(2)} <span style="font-size:11px;color:var(--muted)">${METRIC_UNITS[k]||''}</span></div>
+    </div>`;
+  }).join('');
+}
+
+function renderTelemetryChart(records, assetType) {
+  const labels = records.map(r => new Date(r.timestamp||r.ingested_at).toLocaleTimeString());
+  const metricKeys = Object.keys(records[0].metrics||{}).slice(0,3);
+  const COLORS = ['#58a6ff','#3fb950','#d29922','#bc8cff','#e3650d'];
+  const datasets = metricKeys.map((k,i)=>({
+    label: k.replace(/_/g,' '),
+    data: records.map(r=>{const m=r.metrics||{}; return parseFloat(m[k]||0);}),
+    borderColor: COLORS[i], backgroundColor:'transparent', tension:.3, pointRadius:2
+  }));
+  const ctx = document.getElementById('telemetry-chart');
+  if (telChartInst) telChartInst.destroy();
+  telChartInst = new Chart(ctx, {
+    type:'line', data:{ labels, datasets },
+    options:{
+      plugins:{ legend:{ labels:{ color:'#8b949e',font:{size:11} } } },
+      scales:{
+        x:{ ticks:{color:'#8b949e',font:{size:10}}, grid:{color:'rgba(48,54,61,.5)'} },
+        y:{ ticks:{color:'#8b949e',font:{size:10}}, grid:{color:'rgba(48,54,61,.5)'} }
+      }, animation:false
+    }
+  });
+}
+
+// ─── Anomalies ────────────────────────────────────────────────────────────────
+async function loadAnomalies() {
+  const data = await apiFetch(`${API.anomaly}/api/v1/anomalies`);
+  if (!data) { document.getElementById('anomalies-body').innerHTML = '<tr><td colspan="6" class="empty">Anomaly service unreachable</td></tr>'; return; }
+  state.anomalies = data.anomalies || [];
+  renderAnomaliesTable();
+  updateStatsCards();
+}
+
+function renderAnomaliesTable() {
+  const tb = document.getElementById('anomalies-body');
+  if (!state.anomalies.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No anomalies detected yet 🎉</td></tr>'; return; }
+  const rows = [...state.anomalies].sort((a,b)=>(b.detected_at||b.timestamp||'').localeCompare(a.detected_at||a.timestamp||'')).slice(0,50);
+  tb.innerHTML = rows.map(a=>`
+    <tr>
+      <td>${fmtTs(a.detected_at||a.timestamp)}</td>
+      <td><span class="chip">${a.asset_id?.substring(0,8)||'–'}</span></td>
+      <td>${(a.metric_name||'').replace(/_/g,' ')}</td>
+      <td>${parseFloat(a.value||0).toFixed(2)}</td>
+      <td><span class="badge badge-${(a.severity||'low').toLowerCase()}">${a.severity||'–'}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${(a.recommendations||[]).slice(0,1).join('')||'–'}</td>
+    </tr>`).join('');
+}
+
+// ─── Alerts ───────────────────────────────────────────────────────────────────
+async function loadAlerts() {
+  const data = await apiFetch(`${API.alert}/api/v1/alerts`);
+  if (!data) { document.getElementById('alerts-body').innerHTML = '<tr><td colspan="7" class="empty">Alert service unreachable</td></tr>'; return; }
+  state.alerts = data.alerts || [];
+  document.getElementById('stat-alerts').textContent = state.alerts.filter(a=>a.status==='NEW').length;
+  renderAlertsTable();
+  renderAlertChart();
+}
+
+function renderAlertsTable() {
+  const tb = document.getElementById('alerts-body');
+  if (!state.alerts.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">No alerts 🎉</td></tr>'; return; }
+  const rows = [...state.alerts].sort((a,b)=>(b.created_at||'').localeCompare(a.created_at||'')).slice(0,50);
+  tb.innerHTML = rows.map(a=>`
+    <tr>
+      <td>${fmtTs(a.created_at)}</td>
+      <td><span class="chip">${a.asset_id?.substring(0,8)||'–'}</span></td>
+      <td>${(a.metric_name||'').replace(/_/g,' ')}</td>
+      <td>${parseFloat(a.value||0).toFixed(2)}</td>
+      <td><span class="badge badge-${(a.severity||'low').toLowerCase()}">${a.severity||'–'}</span></td>
+      <td><span class="badge badge-${(a.status||'new').toLowerCase()}">${a.status||'NEW'}</span></td>
+      <td>
+        ${a.status==='NEW'?`<button onclick="ackAlert('${a.alert_id}')" style="background:rgba(88,166,255,.15);color:var(--blue);border:none;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;">Ack</button>`:''}
+        ${a.status!=='RESOLVED'?`<button onclick="resolveAlert('${a.alert_id}')" style="background:rgba(63,185,80,.15);color:var(--green);border:none;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;margin-left:4px;">Resolve</button>`:''}
+      </td>
+    </tr>`).join('');
+}
+
+let alertChartInst = null;
+function renderAlertChart() {
+  const counts = {CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0};
+  state.alerts.forEach(a=>{ if(counts[a.severity]!==undefined) counts[a.severity]++; });
+  const ctx = document.getElementById('alert-chart');
+  if (alertChartInst) alertChartInst.destroy();
+  alertChartInst = new Chart(ctx,{
+    type:'bar',
+    data:{ labels:Object.keys(counts), datasets:[{
+      data:Object.values(counts),
+      backgroundColor:['#f85149','#e3650d','#d29922','#58a6ff'],
+      borderWidth:0, borderRadius:4
+    }]},
+    options:{ plugins:{legend:{display:false}},
+      scales:{ x:{ticks:{color:'#8b949e'},grid:{display:false}}, y:{ticks:{color:'#8b949e'},grid:{color:'rgba(48,54,61,.5)'}} }
+    }
+  });
+}
+
+async function ackAlert(id) {
+  await apiFetch(`${API.alert}/api/v1/alerts/${id}/acknowledge`, {method:'PUT'});
+  logEvent('✅', `Alert ${id.substring(0,8)} acknowledged`); loadAlerts();
+}
+async function resolveAlert(id) {
+  await apiFetch(`${API.alert}/api/v1/alerts/${id}/resolve`, {method:'PUT'});
+  logEvent('✅', `Alert ${id.substring(0,8)} resolved`); loadAlerts();
+}
+
+// ─── Event log ────────────────────────────────────────────────────────────────
+const MAX_LOG = 20;
+const logItems = [];
+function logEvent(icon, msg) {
+  logItems.unshift({ icon, msg, ts: new Date().toLocaleTimeString() });
+  if (logItems.length > MAX_LOG) logItems.pop();
+  document.getElementById('event-log').innerHTML = logItems.map(e=>
+    `<div class="log-item"><div class="ts">${e.ts}</div><div class="msg">${e.icon} ${e.msg}</div></div>`
+  ).join('');
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function fmtTs(ts) {
+  if (!ts) return '–';
+  try { return new Date(ts).toLocaleString(); } catch { return ts; }
+}
+
+// ─── Full refresh ─────────────────────────────────────────────────────────────
+async function refreshAll() {
+  logEvent('🔄', 'Refreshing all data…');
+  await Promise.all([loadAssets(), loadAnomalies(), loadAlerts()]);
+  if (state.selectedAsset) loadTelemetry(state.selectedAsset);
+  logEvent('✅', 'Data refreshed');
+}
+
+// ─── Auto-refresh every 10 s ──────────────────────────────────────────────────
+async function autoRefresh() {
+  await loadAssets();
+  if (document.getElementById('tab-anomalies').classList.contains('active')) loadAnomalies();
+  if (document.getElementById('tab-alerts').classList.contains('active')) loadAlerts();
+  if (document.getElementById('tab-telemetry').classList.contains('active') && state.selectedAsset) {
+    loadTelemetry(state.selectedAsset);
+  }
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+(async () => {
+  logEvent('🚀', 'Platform dashboard starting…');
+  await loadAssets();
+  await loadAnomalies();
+  await loadAlerts();
+  logEvent('✅', 'Connected to all services');
+  setInterval(autoRefresh, 10_000);
+})();
+</script>
+</body>
+</html>

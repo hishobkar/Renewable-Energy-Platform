@@ -1,0 +1,219 @@
+services:
+  # ─── Infrastructure ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: rep_postgres
+    environment:
+      POSTGRES_USER: repuser
+      POSTGRES_PASSWORD: reppass
+      POSTGRES_DB: assetdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repuser -d assetdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: rep_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3
+    container_name: rep_localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: dynamodb,sqs,sns,ses
+      DEFAULT_REGION: us-east-1
+      DISABLE_EVENTS: "1"
+      LOCALSTACK_HOST: localstack
+      DEBUG: "0"
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q 'running\\|available\\|initialized' || curl -sf http://localhost:4566/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # ─── LocalStack Bootstrap ──────────────────────────────────────────────────────
+  localstack-init:
+    image: amazon/aws-cli:latest
+    container_name: rep_localstack_init
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: /bin/sh
+    command: /scripts/init-aws.sh
+    volumes:
+      - ../../scripts:/scripts:ro
+    restart: "no"
+
+  # ─── Asset Service (.NET 9) ───────────────────────────────────────────────────
+  asset-service:
+    build:
+      context: ../../services/asset-service
+      dockerfile: Dockerfile
+    container_name: rep_asset_service
+    ports:
+      - "5001:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=assetdb;Username=repuser;Password=reppass"
+      AWS__ServiceURL: http://localstack:4566
+      AWS__Region: us-east-1
+      AWS__AccessKey: test
+      AWS__SecretKey: test
+      Redis__ConnectionString: redis:6379
+      Sqs__QueueUrl: http://localstack:4566/000000000000/telemetry-events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ─── Telemetry Service (Python) ───────────────────────────────────────────────
+  telemetry-service:
+    build:
+      context: ../../services/telemetry-service
+      dockerfile: Dockerfile
+    container_name: rep_telemetry_service
+    ports:
+      - "5002:8000"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      DYNAMODB_TABLE_TELEMETRY: Telemetry
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/telemetry-events
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:telemetry-topic
+    depends_on:
+      localstack-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── Anomaly Detection Service (Python) ───────────────────────────────────────
+  anomaly-detection-service:
+    build:
+      context: ../../services/anomaly-detection-service
+      dockerfile: Dockerfile
+    container_name: rep_anomaly_service
+    ports:
+      - "5003:8000"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      DYNAMODB_TABLE_TELEMETRY: Telemetry
+      DYNAMODB_TABLE_ANOMALIES: Anomalies
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/telemetry-events
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:anomaly-topic
+    depends_on:
+      localstack-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── Alert Service (Python) ───────────────────────────────────────────────────
+  alert-service:
+    build:
+      context: ../../services/alert-service
+      dockerfile: Dockerfile
+    container_name: rep_alert_service
+    ports:
+      - "5004:8000"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      DYNAMODB_TABLE_ALERTS: Alerts
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/anomaly-events
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:alert-topic
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── Telemetry Simulator ──────────────────────────────────────────────────────
+  simulator:
+    build:
+      context: ../../services/simulator
+      dockerfile: Dockerfile
+    container_name: rep_simulator
+    environment:
+      TELEMETRY_SERVICE_URL: http://telemetry-service:8000
+      ASSET_SERVICE_URL: http://asset-service:8080
+      SIMULATION_INTERVAL_SECONDS: "5"
+    depends_on:
+      telemetry-service:
+        condition: service_healthy
+      asset-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Web Dashboard ────────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ../../services/dashboard
+      dockerfile: Dockerfile
+    container_name: rep_dashboard
+    ports:
+      - "3000:80"
+    environment:
+      ASSET_SERVICE_URL: http://localhost:5001
+      TELEMETRY_SERVICE_URL: http://localhost:5002
+      ANOMALY_SERVICE_URL: http://localhost:5003
+      ALERT_SERVICE_URL: http://localhost:5004
+    depends_on:
+      - asset-service
+      - telemetry-service
+      - anomaly-detection-service
+      - alert-service
+
+volumes:
+  postgres_data:
+  localstack_data:
+
+networks:
+  default:
+    name: renewable-energy-network

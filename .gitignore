@@ -1,0 +1,106 @@
+.claude/
+
+# Build results
+**/bin/
+**/obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider
+.idea/
+
+# VS Code
+.vscode/
+
+# ASP.NET Scaffolding
+ScaffoldingReadMe.txt
+
+# NuGet
+*.nupkg
+packages/
+!**/packages/build/
+
+# Logs
+*.log
+logs/
+
+# Test Results
+TestResults/
+*.trx
+
+# Coverage Reports
+coverage/
+coverage-results/
+*.coverage
+*.coveragexml
+
+# Publish Output
+publish/
+**/publish/
+
+# EF Core Migrations Bundle
+efbundle*
+
+# Local app settings
+appsettings.Development.json
+appsettings.Local.json
+appsettings.*.local.json
+
+# Secrets
+secrets.json
+
+# IIS Express
+iisexpress/
+.config/
+
+# Docker
+**/.docker/
+docker-compose.override.yml
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Generated files
+Generated/
+wwwroot/lib/
+
+# Node (if any frontend exists)
+node_modules/
+dist/
+build/
+
+# Azure
+.publishsettings
+
+# JetBrains Rider
+*.sln.iml
+
+# Resharper
+_ReSharper*/
+*.DotSettings.user
+
+# Backup files
+*.bak
+*.orig
+
+# Certificates
+*.pfx
+*.pem
+*.key
+
+# Environment files
+.env
+.env.*
+
+# GitHub Copilot
+.github/copilot/
