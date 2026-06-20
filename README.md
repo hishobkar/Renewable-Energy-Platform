@@ -1745,4 +1745,16 @@ docker compose down -v
 docker compose up --build
 ```
 
+### Usage of control.html (Simulator)
 
+## What the control panel includes:
+
+| Tab | Operations |
+|---------|------------------|
+| 🏗️ Assets | Register new asset (name, type, capacity, lat/lon, metadata) · Update status (Active/Maintenance/Fault/Inactive) · Delete asset |
+| 📡 Telemetry | Post manual readings with pre-filled metric templates per asset type · Inject anomaly scenarios (Overheating, Excessive Vibration, Power Drop) |
+| 🤖 Simulator | Status check · Fire one-shot burst for all 5 seed assets · Batch-post N rounds at once (useful when the simulator container is stopped) |
+| 🔧 Maintenance | Schedule maintenance with date/time picker, type dropdown, and notes |
+| 🔔 Alerts | View all alerts in a table · Per-row Acknowledge / Resolve buttons · Bulk ack all NEW · Bulk resolve all open |
+
+The sidebar shows all registered assets and acts as a quick-select — clicking any asset pre-fills it into all the relevant dropdowns.
