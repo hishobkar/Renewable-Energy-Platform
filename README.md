@@ -1745,7 +1745,10 @@ docker compose down -v
 docker compose up --build
 ```
 
-### Usage of control.html (Simulator)
+### Usage of control.html (Simulator) 
+
+1. Dashboard: http://localhost:3000
+2. Control panel: http://localhost:3000/control.html
 
 ## What the control panel includes:
 
