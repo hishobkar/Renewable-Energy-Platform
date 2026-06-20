@@ -1,0 +1,790 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Production CodePipeline for the Renewable Energy Platform.
+  Full pipeline: Source → Build → Test → Security → SonarQube → Staging-Deploy
+  → Integration-Tests → Change-Set-Review → Prod-Deploy (Blue/Green CodeDeploy)
+  → Smoke-Tests → Notify. Includes rollback Lambda on pipeline failure.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+  GitHubRepo:
+    Type: String
+    Default: Renewable-Energy-Platform
+  CodeStarConnectionArn:
+    Type: String
+  EcrRepositoryPrefix:
+    Type: String
+    Default: renewable-energy
+  EcsClusterStaging:
+    Type: String
+    Default: renewable-energy-staging
+  EcsClusterProd:
+    Type: String
+    Default: renewable-energy-prod
+  ArtifactBucketName:
+    Type: String
+  NotificationEmail:
+    Type: String
+  SonarCloudToken:
+    Type: String
+    NoEcho: true
+  SonarHostUrl:
+    Type: String
+    Default: 'https://sonarcloud.io'
+  SonarProjectKey:
+    Type: String
+    Default: 'renewable-energy-platform'
+  SonarOrganization:
+    Type: String
+  CodeDeployApplicationName:
+    Type: String
+    Default: renewable-energy-prod
+  CodeDeployDeploymentGroup:
+    Type: String
+    Default: renewable-energy-prod-dg
+
+Resources:
+
+  ProdArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ArtifactBucketName}-prod'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: RetainProdArtifacts
+            Status: Enabled
+            ExpirationInDays: 365
+
+  ProdNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: renewable-energy-prod-pipeline-notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # ─── Rollback Lambda ─────────────────────────────────────────────────────
+  RollbackLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-prod-rollback-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RollbackPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:DescribeServices'
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:RegisterTaskDefinition'
+                  - 'ecs:ListTaskDefinitions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codedeploy:StopDeployment'
+                  - 'codedeploy:GetDeployment'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref ProdNotificationTopic
+              - Effect: Allow
+                Action:
+                  - 'codepipeline:GetPipeline'
+                  - 'codepipeline:GetPipelineExecution'
+                  - 'codepipeline:GetPipelineState'
+                Resource: '*'
+
+  RollbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: renewable-energy-prod-rollback
+      Description: Automatically rolls back prod ECS services when pipeline fails
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt RollbackLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref EcsClusterProd
+          SNS_TOPIC_ARN: !Ref ProdNotificationTopic
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ecs = boto3.client('ecs', region_name=os.environ['AWS_REGION_NAME'])
+          sns = boto3.client('sns', region_name=os.environ['AWS_REGION_NAME'])
+
+          SERVICES = [
+              'asset-service', 'telemetry-service', 'anomaly-detection-service',
+              'alert-service', 'simulator', 'dashboard'
+          ]
+          CLUSTER = os.environ['ECS_CLUSTER']
+          SNS_TOPIC = os.environ['SNS_TOPIC_ARN']
+
+          def handler(event, context):
+              logger.info(f"Rollback triggered by event: {json.dumps(event)}")
+
+              pipeline = event.get('detail', {}).get('pipeline', 'unknown')
+              state = event.get('detail', {}).get('state', 'FAILED')
+
+              if state != 'FAILED':
+                  logger.info(f"Pipeline state is {state}, no rollback needed.")
+                  return {'statusCode': 200, 'body': 'No action needed'}
+
+              rollback_results = []
+
+              for service_name in SERVICES:
+                  try:
+                      # Describe the service to get current task definition
+                      svc = ecs.describe_services(
+                          cluster=CLUSTER,
+                          services=[service_name]
+                      )
+
+                      if not svc['services']:
+                          logger.warning(f"Service {service_name} not found in {CLUSTER}")
+                          continue
+
+                      current_task_def = svc['services'][0]['taskDefinition']
+                      logger.info(f"{service_name}: current task def = {current_task_def}")
+
+                      # Parse ARN to get family and revision
+                      parts = current_task_def.split(':')
+                      family = parts[-2].split('/')[-1]
+                      current_rev = int(parts[-1])
+
+                      if current_rev <= 1:
+                          logger.warning(f"Cannot rollback {service_name}: already at revision 1")
+                          continue
+
+                      prev_rev = current_rev - 1
+                      prev_task_def = f"{family}:{prev_rev}"
+
+                      logger.info(f"Rolling back {service_name} from rev {current_rev} to {prev_rev}")
+
+                      ecs.update_service(
+                          cluster=CLUSTER,
+                          service=service_name,
+                          taskDefinition=prev_task_def,
+                          forceNewDeployment=True
+                      )
+
+                      rollback_results.append({
+                          'service': service_name,
+                          'from': current_rev,
+                          'to': prev_rev,
+                          'status': 'initiated'
+                      })
+
+                  except Exception as e:
+                      logger.error(f"Failed to rollback {service_name}: {e}")
+                      rollback_results.append({
+                          'service': service_name,
+                          'status': 'failed',
+                          'error': str(e)
+                      })
+
+              # Publish rollback notification
+              message = (
+                  f"PROD ROLLBACK INITIATED\n"
+                  f"Pipeline: {pipeline}\n"
+                  f"Trigger: {state}\n"
+                  f"Results:\n" +
+                  "\n".join(
+                      f"  {r['service']}: {r.get('from', '?')} -> {r.get('to', '?')} ({r['status']})"
+                      for r in rollback_results
+                  )
+              )
+
+              sns.publish(
+                  TopicArn=SNS_TOPIC,
+                  Subject='[ALERT] Production Rollback Initiated',
+                  Message=message
+              )
+
+              logger.info(f"Rollback complete: {rollback_results}")
+              return {'statusCode': 200, 'body': json.dumps(rollback_results)}
+
+  # EventBridge rule to trigger rollback Lambda on pipeline failure
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: renewable-energy-prod-pipeline-failure-rollback
+      Description: Trigger rollback Lambda when prod pipeline fails
+      EventPattern:
+        source:
+          - 'aws.codepipeline'
+        detail-type:
+          - 'CodePipeline Pipeline Execution State Change'
+        detail:
+          state:
+            - 'FAILED'
+          pipeline:
+            - !Ref ProdPipeline
+      State: ENABLED
+      Targets:
+        - Id: RollbackLambdaTarget
+          Arn: !GetAtt RollbackLambda.Arn
+
+  LambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RollbackLambda.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineFailureRule.Arn
+
+  # ─── CodeBuild Projects ──────────────────────────────────────────────────
+
+  ProdCodeBuildBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-build
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          - Name: ECR_REPOSITORY_PREFIX
+            Value: !Ref EcrRepositoryPrefix
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec.yml
+      TimeoutInMinutes: 60
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+
+  ProdCodeBuildTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-test
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-test.yml
+      TimeoutInMinutes: 30
+
+  ProdCodeBuildSecurity:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-security
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-security.yml
+      TimeoutInMinutes: 30
+
+  ProdCodeBuildSonar:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-sonar
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SONAR_TOKEN
+            Value: !Ref SonarCloudToken
+          - Name: SONAR_HOST_URL
+            Value: !Ref SonarHostUrl
+          - Name: SONAR_PROJECT_KEY
+            Value: !Ref SonarProjectKey
+          - Name: SONAR_ORGANIZATION
+            Value: !Ref SonarOrganization
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-sonar.yml
+      TimeoutInMinutes: 45
+
+  ProdCodeBuildDeployStaging:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-deploy-staging
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterStaging
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 30
+
+  ProdCodeBuildIntegrationTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-integration-test
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: ASSET_URL
+            Value: 'http://renewable-energy-staging.example.com:5001'
+          - Name: TELEMETRY_URL
+            Value: 'http://renewable-energy-staging.example.com:5002'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-test.yml
+      TimeoutInMinutes: 30
+
+  ProdCodeBuildDeployProd:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-deploy-prod
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: prod
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterProd
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          - Name: CODEDEPLOY_APP
+            Value: !Ref CodeDeployApplicationName
+          - Name: CODEDEPLOY_GROUP
+            Value: !Ref CodeDeployDeploymentGroup
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 60
+
+  ProdCodeBuildSmokeTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-prod-smoke-test
+      ServiceRole: !GetAtt ProdCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: prod
+          - Name: ASSET_SERVICE_URL
+            Value: 'http://renewable-energy.example.com:5001'
+          - Name: TELEMETRY_SERVICE_URL
+            Value: 'http://renewable-energy.example.com:5002'
+          - Name: ANOMALY_SERVICE_URL
+            Value: 'http://renewable-energy.example.com:5003'
+          - Name: ALERT_SERVICE_URL
+            Value: 'http://renewable-energy.example.com:5004'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get update -qq && apt-get install -y curl jq 2>/dev/null || true
+            build:
+              commands:
+                - bash ci-cd/scripts/smoke-test.sh prod
+          artifacts:
+            files:
+              - smoke-test-results.json
+      TimeoutInMinutes: 15
+
+  # ─── Prod Pipeline ────────────────────────────────────────────────────────
+  ProdPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: renewable-energy-prod-pipeline
+      RoleArn: !GetAtt ProdCodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ProdArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: main
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: BuildImages
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+        - Name: Test
+          Actions:
+            - Name: RunUnitTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: TestArtifact
+              RunOrder: 1
+
+        - Name: Security
+          Actions:
+            - Name: SecurityScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildSecurity
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SecurityArtifact
+              RunOrder: 1
+
+        - Name: SonarQube
+          Actions:
+            - Name: SonarQubeScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildSonar
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SonarArtifact
+              RunOrder: 1
+
+        - Name: Staging-Deploy
+          Actions:
+            - Name: DeployToStaging
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildDeployStaging
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: StagingDeployArtifact
+              RunOrder: 1
+
+        - Name: Integration-Tests
+          Actions:
+            - Name: RunIntegrationTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildIntegrationTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: IntegrationTestArtifact
+              RunOrder: 1
+
+        - Name: Change-Set-Review
+          Actions:
+            - Name: ManualApprovalForProduction
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref ProdNotificationTopic
+                CustomData: >
+                  All pre-prod gates have passed: unit tests, security scan,
+                  SonarQube quality gate, staging deploy, and integration tests.
+                  Please review the change set and approve production deployment.
+                  IMPORTANT: This will trigger a blue/green deployment to production.
+                ExternalEntityLink: !Sub 'https://console.aws.amazon.com/ecs/home?region=${AWS::Region}#/clusters/${EcsClusterStaging}/services'
+              RunOrder: 1
+
+        - Name: Prod-Deploy
+          Actions:
+            - Name: DeployToProduction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildDeployProd
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: ProdDeployArtifact
+              RunOrder: 1
+
+        - Name: Smoke-Tests
+          Actions:
+            - Name: RunProdSmokeTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ProdCodeBuildSmokeTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SmokeTestArtifact
+              RunOrder: 1
+
+        - Name: Notify
+          Actions:
+            - Name: NotifyDeploymentSuccess
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref RollbackLambda
+                UserParameters: !Sub |
+                  {"action": "notify", "pipeline": "renewable-energy-prod-pipeline", "state": "SUCCEEDED"}
+              InputArtifacts:
+                - Name: ProdDeployArtifact
+              RunOrder: 1
+
+      Tags:
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── IAM Roles ──────────────────────────────────────────────────────────
+  ProdCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-prod-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ProdCodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:GetBucketVersioning'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-prod'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-prod/*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'codestar-connections:UseConnection'
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref ProdNotificationTopic
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt RollbackLambda.Arn
+
+  ProdCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-prod-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: ProdCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-prod'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-prod/*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:RegisterTaskDefinition'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'ecs-tasks.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentGroup'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/renewable-energy/*'
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:renewable-energy/*'
+              - Effect: Allow
+                Action:
+                  - 'eks:DescribeCluster'
+                  - 'eks:ListClusters'
+                Resource: '*'
+
+Outputs:
+  ProdPipelineName:
+    Value: !Ref ProdPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-ProdPipelineName'
+  RollbackLambdaArn:
+    Value: !GetAtt RollbackLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RollbackLambdaArn'
+  ProdNotificationTopicArn:
+    Value: !Ref ProdNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ProdNotificationTopic'

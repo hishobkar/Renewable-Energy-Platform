@@ -1,0 +1,632 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Main CodePipeline for the Renewable Energy Platform.
+  Stages: Source → Build → Test → SecurityScan → Deploy-Dev → Approval → Deploy-Staging → Deploy-Prod
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner/org
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: Renewable-Energy-Platform
+  GitHubBranch:
+    Type: String
+    Description: Branch to trigger pipeline
+    Default: main
+  CodeStarConnectionArn:
+    Type: String
+    Description: ARN of the CodeStar Connection to GitHub
+  EcrRepositoryPrefix:
+    Type: String
+    Description: ECR repository prefix for all images
+    Default: renewable-energy
+  EcsClusterDev:
+    Type: String
+    Description: ECS cluster name for dev environment
+    Default: renewable-energy-dev
+  EcsClusterStaging:
+    Type: String
+    Description: ECS cluster name for staging environment
+    Default: renewable-energy-staging
+  EcsClusterProd:
+    Type: String
+    Description: ECS cluster name for production environment
+    Default: renewable-energy-prod
+  ArtifactBucketName:
+    Type: String
+    Description: S3 bucket name for pipeline artifacts
+  NotificationEmail:
+    Type: String
+    Description: Email for approval and failure notifications
+  SonarCloudToken:
+    Type: String
+    Description: SonarCloud authentication token
+    NoEcho: true
+  EnvironmentName:
+    Type: String
+    Description: Top-level environment name tag
+    Default: production
+
+Resources:
+
+  # ─── S3 Artifact Bucket ─────────────────────────────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ArtifactBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: renewable-energy-platform
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${ArtifactBucketName}'
+              - !Sub 'arn:aws:s3:::${ArtifactBucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ─── SNS Topic for approvals and notifications ───────────────────────────
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'renewable-energy-pipeline-notifications-${EnvironmentName}'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodeBuild — Main Build ──────────────────────────────────────────────
+  CodeBuildProjectBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'renewable-energy-build-${EnvironmentName}'
+      Description: Build all Docker images for the Renewable Energy Platform
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          - Name: ECR_REPOSITORY_PREFIX
+            Value: !Ref EcrRepositoryPrefix
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec.yml
+      TimeoutInMinutes: 60
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+          - LOCAL_SOURCE_CACHE
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodeBuild — Tests ──────────────────────────────────────────────────
+  CodeBuildProjectTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'renewable-energy-test-${EnvironmentName}'
+      Description: Run all unit and integration tests
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-test.yml
+      TimeoutInMinutes: 30
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_SOURCE_CACHE
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodeBuild — Security Scan ──────────────────────────────────────────
+  CodeBuildProjectSecurity:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'renewable-energy-security-${EnvironmentName}'
+      Description: Security scanning - Trivy, Bandit, TruffleHog, Safety
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-security.yml
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodeBuild — Deploy Dev ──────────────────────────────────────────────
+  CodeBuildProjectDeployDev:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'renewable-energy-deploy-dev-${EnvironmentName}'
+      Description: Deploy all services to the dev ECS cluster
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: dev
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterDev
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodeBuild — Deploy Staging ──────────────────────────────────────────
+  CodeBuildProjectDeployStaging:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'renewable-energy-deploy-staging-${EnvironmentName}'
+      Description: Deploy all services to the staging ECS cluster
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterStaging
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodeBuild — Deploy Prod ─────────────────────────────────────────────
+  CodeBuildProjectDeployProd:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'renewable-energy-deploy-prod-${EnvironmentName}'
+      Description: Deploy all services to the production ECS cluster
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: prod
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterProd
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 45
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── CodePipeline ────────────────────────────────────────────────────────
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub 'renewable-energy-pipeline-${EnvironmentName}'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: BuildImages
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+        - Name: Test
+          Actions:
+            - Name: RunTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: TestArtifact
+              RunOrder: 1
+
+        - Name: SecurityScan
+          Actions:
+            - Name: SecurityScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectSecurity
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SecurityArtifact
+              RunOrder: 1
+
+        - Name: Deploy-Dev
+          Actions:
+            - Name: DeployToDev
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectDeployDev
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: DevDeployArtifact
+              RunOrder: 1
+
+        - Name: Approval
+          Actions:
+            - Name: ManualApprovalForStaging
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref PipelineNotificationTopic
+                CustomData: 'Review dev deployment and approve promotion to staging.'
+                ExternalEntityLink: !Sub 'https://console.aws.amazon.com/ecs/home?region=${AWS::Region}#/clusters/${EcsClusterDev}/services'
+              RunOrder: 1
+
+        - Name: Deploy-Staging
+          Actions:
+            - Name: DeployToStaging
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectDeployStaging
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: StagingDeployArtifact
+              RunOrder: 1
+
+        - Name: Deploy-Prod
+          Actions:
+            - Name: ManualApprovalForProd
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref PipelineNotificationTopic
+                CustomData: 'Review staging deployment and approve promotion to production.'
+                ExternalEntityLink: !Sub 'https://console.aws.amazon.com/ecs/home?region=${AWS::Region}#/clusters/${EcsClusterStaging}/services'
+              RunOrder: 1
+            - Name: DeployToProd
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectDeployProd
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: ProdDeployArtifact
+              RunOrder: 2
+
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ─── IAM Role: CodePipeline ──────────────────────────────────────────────
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'renewable-energy-codepipeline-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}/*'
+              - Sid: CodeBuildAccess
+                Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:StopBuild'
+                Resource:
+                  - !GetAtt CodeBuildProjectBuild.Arn
+                  - !GetAtt CodeBuildProjectTest.Arn
+                  - !GetAtt CodeBuildProjectSecurity.Arn
+                  - !GetAtt CodeBuildProjectDeployDev.Arn
+                  - !GetAtt CodeBuildProjectDeployStaging.Arn
+                  - !GetAtt CodeBuildProjectDeployProd.Arn
+              - Sid: CodeStarConnectionAccess
+                Effect: Allow
+                Action:
+                  - 'codestar-connections:UseConnection'
+                Resource: !Ref CodeStarConnectionArn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref PipelineNotificationTopic
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey'
+                  - 'kms:Decrypt'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── IAM Role: CodeBuild ─────────────────────────────────────────────────
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'renewable-energy-codebuild-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:GetBucketAcl'
+                  - 's3:GetBucketLocation'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}/*'
+              - Sid: ECRAccess
+                Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:PutImage'
+                  - 'ecr:CreateRepository'
+                  - 'ecr:DescribeRepositories'
+                Resource: '*'
+              - Sid: ECSAccess
+                Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:RegisterTaskDefinition'
+                  - 'ecs:ListTasks'
+                  - 'ecs:DescribeTasks'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ecs:cluster':
+                      - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${EcsClusterDev}'
+                      - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${EcsClusterStaging}'
+                      - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${EcsClusterProd}'
+              - Sid: IAMPassRole
+                Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'ecs-tasks.amazonaws.com'
+              - Sid: SSMParameterStore
+                Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/renewable-energy/*'
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:renewable-energy/*'
+              - Sid: EKSAccess
+                Effect: Allow
+                Action:
+                  - 'eks:DescribeCluster'
+                  - 'eks:ListClusters'
+                Resource: '*'
+              - Sid: CodeDeployAccess
+                Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentGroup'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: renewable-energy-platform
+
+Outputs:
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+
+  PipelineArn:
+    Description: ARN of the CodePipeline
+    Value: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineArn'
+
+  ArtifactBucketName:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactBucket'
+
+  NotificationTopicArn:
+    Description: SNS Topic ARN for pipeline notifications
+    Value: !Ref PipelineNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'

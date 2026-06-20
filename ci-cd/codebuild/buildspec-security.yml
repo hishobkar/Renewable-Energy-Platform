@@ -1,0 +1,347 @@
+version: 0.2
+
+env:
+  variables:
+    TRIVY_VERSION: "0.47.0"
+    TRUFFLEHOG_VERSION: "3.63.2"
+    SEVERITY_THRESHOLD: "HIGH,CRITICAL"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.11"
+    commands:
+      - echo "=== Installing security scanning tools ==="
+
+      # Install Trivy
+      - echo "Installing Trivy $TRIVY_VERSION..."
+      - wget -q "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+          -O /tmp/trivy.tar.gz
+      - tar -xzf /tmp/trivy.tar.gz -C /tmp
+      - mv /tmp/trivy /usr/local/bin/trivy
+      - chmod +x /usr/local/bin/trivy
+      - trivy --version
+
+      # Install TruffleHog
+      - echo "Installing TruffleHog $TRUFFLEHOG_VERSION..."
+      - wget -q "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" \
+          -O /tmp/trufflehog.tar.gz
+      - tar -xzf /tmp/trufflehog.tar.gz -C /tmp
+      - mv /tmp/trufflehog /usr/local/bin/trufflehog
+      - chmod +x /usr/local/bin/trufflehog
+      - trufflehog --version
+
+      # Install Python security tools
+      - pip install --upgrade pip
+      - pip install safety==2.3.5 bandit==1.7.5
+
+      # Install Python service dependencies (needed for safety check)
+      - |
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          if [ -f "services/$SERVICE/requirements.txt" ]; then
+            pip install -q -r "services/$SERVICE/requirements.txt" 2>/dev/null || true
+          fi
+        done
+
+  pre_build:
+    commands:
+      - echo "=== Pre-build: Creating output directories ==="
+      - mkdir -p security-reports/trivy
+      - mkdir -p security-reports/bandit
+      - mkdir -p security-reports/safety
+      - mkdir -p security-reports/trufflehog
+      - IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-8)
+      - export IMAGE_TAG
+      - echo "Security scan for commit: $IMAGE_TAG"
+
+  build:
+    commands:
+      - echo "=== Build phase: Running security scans ==="
+
+      # ─── Trivy filesystem scans ──────────────────────────────────────────
+      - echo "--- Running Trivy filesystem scans ---"
+      - |
+        TRIVY_FAILED=false
+        for SERVICE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+          echo "Scanning $SERVICE with Trivy..."
+
+          # JSON output for aggregation
+          trivy fs \
+            "services/$SERVICE" \
+            --severity "$SEVERITY_THRESHOLD" \
+            --format json \
+            --output "security-reports/trivy/trivy-$SERVICE.json" \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --scanners vuln,secret,config \
+            2>/dev/null || true
+
+          # Table output for human reading
+          trivy fs \
+            "services/$SERVICE" \
+            --severity "$SEVERITY_THRESHOLD" \
+            --format table \
+            --output "security-reports/trivy/trivy-$SERVICE.txt" \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --scanners vuln,secret,config \
+            2>/dev/null || true
+
+          # SARIF output for upload
+          trivy fs \
+            "services/$SERVICE" \
+            --severity "$SEVERITY_THRESHOLD" \
+            --format sarif \
+            --output "security-reports/trivy/trivy-$SERVICE.sarif" \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --scanners vuln,secret \
+            2>/dev/null || true
+
+          CRITICAL_COUNT=$(python3 -c "
+        import json
+        try:
+            with open('security-reports/trivy/trivy-$SERVICE.json') as f:
+                data = json.load(f)
+            count = sum(
+                1 for r in data.get('Results', [])
+                for v in r.get('Vulnerabilities', [])
+                if v.get('Severity') == 'CRITICAL'
+            )
+            print(count)
+        except:
+            print(0)
+        " 2>/dev/null || echo 0)
+
+          echo "$SERVICE: $CRITICAL_COUNT CRITICAL vulnerabilities found"
+
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "WARNING: CRITICAL vulnerabilities in $SERVICE"
+            cat "security-reports/trivy/trivy-$SERVICE.txt"
+            TRIVY_FAILED=true
+          fi
+        done
+
+        echo "Trivy filesystem scan complete."
+
+      # ─── Bandit SAST on Python services ──────────────────────────────────
+      - echo "--- Running Bandit SAST on Python services ---"
+      - |
+        BANDIT_FAILED=false
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          echo "Running Bandit on $SERVICE..."
+
+          bandit \
+            -r "services/$SERVICE" \
+            --format json \
+            --output "security-reports/bandit/bandit-$SERVICE.json" \
+            --exclude "services/$SERVICE/tests,services/$SERVICE/.venv,services/$SERVICE/venv" \
+            --severity-level medium \
+            --confidence-level medium \
+            2>/dev/null || true
+
+          bandit \
+            -r "services/$SERVICE" \
+            --format txt \
+            --output "security-reports/bandit/bandit-$SERVICE.txt" \
+            --exclude "services/$SERVICE/tests,services/$SERVICE/.venv,services/$SERVICE/venv" \
+            --severity-level medium \
+            --confidence-level medium \
+            2>/dev/null || true
+
+          HIGH_COUNT=$(python3 -c "
+        import json
+        try:
+            with open('security-reports/bandit/bandit-$SERVICE.json') as f:
+                data = json.load(f)
+            count = sum(
+                1 for r in data.get('results', [])
+                if r.get('issue_severity') in ('HIGH', 'CRITICAL')
+            )
+            print(count)
+        except:
+            print(0)
+        " 2>/dev/null || echo 0)
+
+          echo "$SERVICE: $HIGH_COUNT HIGH/CRITICAL Bandit issues found"
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            echo "WARNING: High-severity issues in $SERVICE"
+            cat "security-reports/bandit/bandit-$SERVICE.txt" || true
+          fi
+        done
+
+      # ─── Safety check on Python requirements ─────────────────────────────
+      - echo "--- Running Safety check on Python requirements ---"
+      - |
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          REQ="services/$SERVICE/requirements.txt"
+          if [ -f "$REQ" ]; then
+            echo "Checking $SERVICE requirements..."
+            safety check \
+              -r "$REQ" \
+              --json \
+              --output "security-reports/safety/safety-$SERVICE.json" \
+              2>/dev/null || true
+
+            VULN_COUNT=$(python3 -c "
+        import json
+        try:
+            with open('security-reports/safety/safety-$SERVICE.json') as f:
+                data = json.load(f)
+            # safety output format varies by version
+            if isinstance(data, list):
+                print(len(data))
+            else:
+                vulns = data.get('vulnerabilities', data.get('affected_packages', []))
+                print(len(vulns))
+        except:
+            print(0)
+        " 2>/dev/null || echo 0)
+
+            echo "$SERVICE: $VULN_COUNT known vulnerabilities in requirements"
+          fi
+        done
+
+      # ─── TruffleHog secrets scan ──────────────────────────────────────────
+      - echo "--- Running TruffleHog secrets scan ---"
+      - |
+        trufflehog filesystem . \
+          --only-verified \
+          --json \
+          --exclude-paths=.trufflehogignore \
+          2>/dev/null | tee security-reports/trufflehog/trufflehog-scan.json || true
+
+        SECRET_COUNT=$(grep -c '"SourceMetadata"' security-reports/trufflehog/trufflehog-scan.json 2>/dev/null || echo 0)
+        echo "TruffleHog: $SECRET_COUNT verified secrets found"
+        if [ "$SECRET_COUNT" -gt 0 ]; then
+          echo "CRITICAL: Verified secrets found in codebase!"
+          cat security-reports/trufflehog/trufflehog-scan.json
+        fi
+
+  post_build:
+    commands:
+      - echo "=== Post-build: Aggregating security findings ==="
+
+      # Aggregate all findings into security-report.json
+      - |
+        python3 << 'PYEOF'
+        import json
+        import os
+        import glob
+        from datetime import datetime, timezone
+
+        report = {
+            "scan_date": datetime.now(timezone.utc).isoformat(),
+            "commit": os.environ.get("CODEBUILD_RESOLVED_SOURCE_VERSION", "unknown"),
+            "summary": {
+                "trivy": {"critical": 0, "high": 0, "medium": 0, "services_scanned": []},
+                "bandit": {"high": 0, "medium": 0, "services_scanned": []},
+                "safety": {"vulnerabilities": 0, "services_scanned": []},
+                "trufflehog": {"secrets_found": 0},
+            },
+            "details": {}
+        }
+
+        # Aggregate Trivy results
+        for f in glob.glob("security-reports/trivy/trivy-*.json"):
+            service = os.path.basename(f).replace("trivy-", "").replace(".json", "")
+            try:
+                with open(f) as fh:
+                    data = json.load(fh)
+                critical = sum(1 for r in data.get("Results", [])
+                               for v in r.get("Vulnerabilities", [])
+                               if v.get("Severity") == "CRITICAL")
+                high = sum(1 for r in data.get("Results", [])
+                           for v in r.get("Vulnerabilities", [])
+                           if v.get("Severity") == "HIGH")
+                medium = sum(1 for r in data.get("Results", [])
+                             for v in r.get("Vulnerabilities", [])
+                             if v.get("Severity") == "MEDIUM")
+                report["summary"]["trivy"]["critical"] += critical
+                report["summary"]["trivy"]["high"] += high
+                report["summary"]["trivy"]["medium"] += medium
+                report["summary"]["trivy"]["services_scanned"].append(service)
+                report["details"].setdefault("trivy", {})[service] = {
+                    "critical": critical, "high": high, "medium": medium
+                }
+            except Exception as e:
+                print(f"Could not parse {f}: {e}")
+
+        # Aggregate Bandit results
+        for f in glob.glob("security-reports/bandit/bandit-*.json"):
+            service = os.path.basename(f).replace("bandit-", "").replace(".json", "")
+            try:
+                with open(f) as fh:
+                    data = json.load(fh)
+                high = sum(1 for r in data.get("results", [])
+                           if r.get("issue_severity") in ("HIGH", "CRITICAL"))
+                medium = sum(1 for r in data.get("results", [])
+                             if r.get("issue_severity") == "MEDIUM")
+                report["summary"]["bandit"]["high"] += high
+                report["summary"]["bandit"]["medium"] += medium
+                report["summary"]["bandit"]["services_scanned"].append(service)
+            except Exception as e:
+                print(f"Could not parse {f}: {e}")
+
+        # Aggregate Safety results
+        for f in glob.glob("security-reports/safety/safety-*.json"):
+            service = os.path.basename(f).replace("safety-", "").replace(".json", "")
+            try:
+                with open(f) as fh:
+                    data = json.load(fh)
+                if isinstance(data, list):
+                    count = len(data)
+                else:
+                    count = len(data.get("vulnerabilities", data.get("affected_packages", [])))
+                report["summary"]["safety"]["vulnerabilities"] += count
+                report["summary"]["safety"]["services_scanned"].append(service)
+            except Exception as e:
+                print(f"Could not parse {f}: {e}")
+
+        # TruffleHog results
+        try:
+            with open("security-reports/trufflehog/trufflehog-scan.json") as fh:
+                content = fh.read()
+            report["summary"]["trufflehog"]["secrets_found"] = content.count('"SourceMetadata"')
+        except:
+            pass
+
+        # Write report
+        with open("security-reports/security-report.json", "w") as fh:
+            json.dump(report, fh, indent=2)
+
+        # Print summary
+        print("\n" + "="*60)
+        print("SECURITY SCAN SUMMARY")
+        print("="*60)
+        print(f"Trivy - CRITICAL: {report['summary']['trivy']['critical']}, HIGH: {report['summary']['trivy']['high']}")
+        print(f"Bandit - HIGH: {report['summary']['bandit']['high']}, MEDIUM: {report['summary']['bandit']['medium']}")
+        print(f"Safety - Vulnerabilities: {report['summary']['safety']['vulnerabilities']}")
+        print(f"TruffleHog - Secrets: {report['summary']['trufflehog']['secrets_found']}")
+        print("="*60)
+
+        # Fail if critical issues found
+        if (report["summary"]["trivy"]["critical"] > 0 or
+            report["summary"]["trufflehog"]["secrets_found"] > 0):
+            print("CRITICAL security issues found. Build failed.")
+            exit(1)
+        else:
+            print("No critical security issues found.")
+        PYEOF
+
+      - echo "Security scan complete."
+
+artifacts:
+  files:
+    - security-reports/security-report.json
+    - security-reports/trivy/**/*
+    - security-reports/bandit/**/*
+    - security-reports/safety/**/*
+    - security-reports/trufflehog/**/*
+  name: SecurityArtifacts
+  discard-paths: no
+
+cache:
+  paths:
+    - '/root/.cache/pip/**/*'
+    - '/tmp/trivy-cache/**/*'

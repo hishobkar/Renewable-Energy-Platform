@@ -1,0 +1,265 @@
+name: Performance Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+      duration:
+        description: 'Test duration in seconds'
+        required: true
+        default: '60'
+        type: string
+      vus:
+        description: 'Number of virtual users'
+        required: true
+        default: '10'
+        type: string
+
+env:
+  K6_VERSION: v0.49.0
+
+jobs:
+  performance-test:
+    name: Run k6 performance tests against ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment URLs
+        id: urls
+        run: |
+          if [ "${{ inputs.environment }}" = "dev" ]; then
+            echo "asset_url=http://renewable-energy-dev.example.com:5001" >> "$GITHUB_OUTPUT"
+            echo "telemetry_url=http://renewable-energy-dev.example.com:5002" >> "$GITHUB_OUTPUT"
+            echo "anomaly_url=http://renewable-energy-dev.example.com:5003" >> "$GITHUB_OUTPUT"
+            echo "alert_url=http://renewable-energy-dev.example.com:5004" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.environment }}" = "staging" ]; then
+            echo "asset_url=http://renewable-energy-staging.example.com:5001" >> "$GITHUB_OUTPUT"
+            echo "telemetry_url=http://renewable-energy-staging.example.com:5002" >> "$GITHUB_OUTPUT"
+            echo "anomaly_url=http://renewable-energy-staging.example.com:5003" >> "$GITHUB_OUTPUT"
+            echo "alert_url=http://renewable-energy-staging.example.com:5004" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/${{ env.K6_VERSION }}/k6-${{ env.K6_VERSION }}-linux-amd64.tar.gz \
+            | tar -xz --strip-components=1
+          sudo mv k6 /usr/local/bin/k6
+          k6 version
+
+      - name: Write k6 test script
+        run: |
+          mkdir -p k6-results
+          cat > k6-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep, group } from 'k6';
+          import { Rate, Trend } from 'k6/metrics';
+
+          const errorRate = new Rate('errors');
+          const assetGetDuration = new Trend('asset_get_duration', true);
+          const telemetryPostDuration = new Trend('telemetry_post_duration', true);
+
+          export const options = {
+            vus: __ENV.VUS ? parseInt(__ENV.VUS) : 10,
+            duration: __ENV.DURATION ? `${__ENV.DURATION}s` : '60s',
+            thresholds: {
+              // p95 latency must be below 500ms
+              'http_req_duration{name:get_assets}': ['p(95)<500'],
+              'http_req_duration{name:post_telemetry}': ['p(95)<500'],
+              // error rate must be below 1%
+              'errors': ['rate<0.01'],
+              // overall p95 across all requests
+              'http_req_duration': ['p(95)<500'],
+            },
+          };
+
+          const ASSET_URL = __ENV.ASSET_URL || 'http://localhost:5001';
+          const TELEMETRY_URL = __ENV.TELEMETRY_URL || 'http://localhost:5002';
+
+          function generateTelemetryPayload(assetId) {
+            return JSON.stringify({
+              asset_id: assetId || 'test-asset-001',
+              timestamp: new Date().toISOString(),
+              metrics: {
+                power_output_kw: Math.random() * 500,
+                voltage: 220 + Math.random() * 20,
+                current: Math.random() * 100,
+                temperature_celsius: 20 + Math.random() * 40,
+                efficiency_percent: 85 + Math.random() * 15,
+              },
+              status: 'operational',
+            });
+          }
+
+          export default function () {
+            group('Asset Service', () => {
+              // GET /api/v1/assets
+              const assetsRes = http.get(`${ASSET_URL}/api/v1/assets`, {
+                tags: { name: 'get_assets' },
+                headers: {
+                  'Accept': 'application/json',
+                  'Content-Type': 'application/json',
+                },
+              });
+
+              const assetOk = check(assetsRes, {
+                'GET /api/v1/assets returns 200': (r) => r.status === 200,
+                'GET /api/v1/assets has body': (r) => r.body && r.body.length > 0,
+                'GET /api/v1/assets response time < 500ms': (r) => r.timings.duration < 500,
+              });
+
+              errorRate.add(!assetOk);
+              assetGetDuration.add(assetsRes.timings.duration);
+
+              // GET health check
+              const healthRes = http.get(`${ASSET_URL}/health`, {
+                tags: { name: 'asset_health' },
+              });
+
+              check(healthRes, {
+                'Asset service health check returns 200': (r) => r.status === 200,
+              });
+            });
+
+            sleep(0.5);
+
+            group('Telemetry Service', () => {
+              // POST /api/v1/telemetry
+              const payload = generateTelemetryPayload();
+              const telemetryRes = http.post(
+                `${TELEMETRY_URL}/api/v1/telemetry`,
+                payload,
+                {
+                  tags: { name: 'post_telemetry' },
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                  },
+                }
+              );
+
+              const telemetryOk = check(telemetryRes, {
+                'POST /api/v1/telemetry returns 200 or 201': (r) => r.status === 200 || r.status === 201,
+                'POST /api/v1/telemetry has body': (r) => r.body && r.body.length > 0,
+                'POST /api/v1/telemetry response time < 500ms': (r) => r.timings.duration < 500,
+              });
+
+              errorRate.add(!telemetryOk);
+              telemetryPostDuration.add(telemetryRes.timings.duration);
+
+              // GET health check
+              const telHealthRes = http.get(`${TELEMETRY_URL}/health`, {
+                tags: { name: 'telemetry_health' },
+              });
+
+              check(telHealthRes, {
+                'Telemetry service health check returns 200': (r) => r.status === 200,
+              });
+            });
+
+            sleep(Math.random() * 1 + 0.5);
+          }
+
+          export function handleSummary(data) {
+            return {
+              'k6-results/summary.json': JSON.stringify(data, null, 2),
+              'k6-results/summary.txt': textSummary(data, { indent: ' ', enableColors: false }),
+            };
+          }
+
+          function textSummary(data, opts) {
+            const indent = opts.indent || '';
+            let result = `${indent}Performance Test Summary\n`;
+            result += `${indent}========================\n`;
+            result += `${indent}Environment: ${__ENV.ENVIRONMENT || 'unknown'}\n`;
+            result += `${indent}Duration: ${__ENV.DURATION || 60}s\n`;
+            result += `${indent}Virtual Users: ${__ENV.VUS || 10}\n\n`;
+
+            if (data.metrics) {
+              const dur = data.metrics.http_req_duration;
+              if (dur) {
+                result += `${indent}HTTP Request Duration:\n`;
+                result += `${indent}  avg: ${dur.values.avg ? dur.values.avg.toFixed(2) : 'N/A'}ms\n`;
+                result += `${indent}  p95: ${dur.values['p(95)'] ? dur.values['p(95)'].toFixed(2) : 'N/A'}ms\n`;
+                result += `${indent}  p99: ${dur.values['p(99)'] ? dur.values['p(99)'].toFixed(2) : 'N/A'}ms\n`;
+              }
+
+              const reqs = data.metrics.http_reqs;
+              if (reqs) {
+                result += `${indent}Total Requests: ${reqs.values.count}\n`;
+                result += `${indent}Request Rate: ${reqs.values.rate ? reqs.values.rate.toFixed(2) : 'N/A'}/s\n`;
+              }
+
+              const errors = data.metrics.errors;
+              if (errors) {
+                result += `${indent}Error Rate: ${errors.values.rate ? (errors.values.rate * 100).toFixed(2) : '0.00'}%\n`;
+              }
+            }
+
+            return result;
+          }
+          EOF
+
+      - name: Run k6 performance tests
+        run: |
+          k6 run \
+            --env ASSET_URL=${{ steps.urls.outputs.asset_url }} \
+            --env TELEMETRY_URL=${{ steps.urls.outputs.telemetry_url }} \
+            --env ENVIRONMENT=${{ inputs.environment }} \
+            --env DURATION=${{ inputs.duration }} \
+            --env VUS=${{ inputs.vus }} \
+            --out json=k6-results/raw-output.json \
+            k6-test.js \
+            2>&1 | tee k6-results/k6-run.log
+
+      - name: Parse and display results
+        if: always()
+        run: |
+          echo "=== Performance Test Results ==="
+          if [ -f k6-results/summary.txt ]; then
+            cat k6-results/summary.txt
+          fi
+
+          echo ""
+          echo "=== Threshold Results ==="
+          if [ -f k6-results/summary.json ]; then
+            python3 - << 'PYEOF'
+          import json
+          import sys
+
+          with open('k6-results/summary.json') as f:
+              data = json.load(f)
+
+          thresholds = data.get('thresholds', {})
+          all_passed = True
+          for metric, result in thresholds.items():
+              status = "PASS" if not result.get('ok') == False else "FAIL"
+              if result.get('ok') == False:
+                  all_passed = False
+              print(f"  {status}: {metric}")
+
+          if not all_passed:
+              print("\nSome thresholds failed!")
+              sys.exit(1)
+          else:
+              print("\nAll thresholds passed!")
+          PYEOF
+          fi
+
+      - name: Upload k6 results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-performance-results-${{ inputs.environment }}-${{ github.run_id }}
+          path: k6-results/
+          retention-days: 30

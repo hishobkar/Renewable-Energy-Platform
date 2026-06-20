@@ -61,9 +61,6 @@ git clone https://github.com/your-repo/renewable-energy-platform.git
 cd renewable-energy-platform
 ```
 
-
-
-
 ### Project Structure
 
 ```
@@ -1737,6 +1734,51 @@ smart-renewable-energy-platform/
 ├── CODE_OF_CONDUCT.md
 └── Makefile
 ```
+
+
+## What is built in `ci-cd/`
+
+### `github-actions/` (5 workflows)
+| File | Purpose |
+|------|---------|
+| `ci.yml` | Triggered on every push/PR — lint (.NET + Python), unit tests, Docker build matrix for all 6 services, Trivy filesystem scan |
+| `cd.yml` | Triggered on `main` push — ECR build+push, ECS force-new-deploy to dev, manual-approval gate for staging, Slack notification |
+| `security-scan.yml` | Weekly + on push — Trivy image scans (SARIF→GitHub Security), CodeQL for C# and Python, `safety`+`dotnet vulnerable` dependency checks, TruffleHog secrets scan |
+| `performance-test.yml` | Manual trigger — k6 load test with configurable `vus`/`duration`, p95 < 500ms and error rate < 1% assertions |
+| `release.yml` | Tag-triggered (`v*.*.*`) — pushes `$VERSION` + `latest` to ECR, blue/green CodeDeploy to prod, GitHub Release with changelog |
+
+### `codebuild/` (6 buildspecs)
+| File | Purpose |
+|------|---------|
+| `buildspec.yml` | Full build: install runtimes → ECR login → build all images → test → push → emit `imagedefinitions.json` |
+| `buildspec-test.yml` | Test-only with coverage (TRX + JUnit XML for CodeBuild Reports) |
+| `buildspec-sonar.yml` | SonarCloud analysis for both C# and Python; polls quality gate and fails on red |
+| `buildspec-security.yml` | Trivy + Bandit + Safety + TruffleHog; aggregates into `security-report.json` |
+| `buildspec-package.yml` | Helm chart packaging → S3 upload, generates multi-env k8s manifests |
+| `buildspec-deploy.yml` | Registers new ECS task defs, updates services, waits for stability, curl smoke tests |
+
+### `codepipeline/` (5 CloudFormation templates + params)
+| File | Purpose |
+|------|---------|
+| `pipeline.yml` | Main pipeline: Source→Build→Test→Security→Dev→SNS Approval→Staging→Manual Approval→Prod |
+| `pipeline-dev.yml` | Dev pipeline (no approval, nightly k6 perf via EventBridge) |
+| `pipeline-staging.yml` | `release/*` branches: SonarQube + Trivy + integration tests + manual approval |
+| `pipeline-prod.yml` | Full prod with rollback Lambda that auto-reverts on pipeline failure |
+| `pipeline-parameters.json` | Sample parameter values for all CloudFormation stacks |
+
+### `scripts/` (9 shell scripts — all executable bash)
+| Script | Purpose |
+|--------|---------|
+| `build-all.sh` | Build all 6 images locally with per-image timing |
+| `push-images.sh` | ECR login, create repos with lifecycle policies, push with tag + `latest` |
+| `deploy-dev.sh` | ECS force-new-deploy to dev, wait for stability |
+| `deploy-staging.sh` | Run dev smoke tests first, then deploy to staging |
+| `deploy-prod.sh` | CloudWatch alarm guard + CodeDeploy blue/green, auto-calls `rollback.sh` on failure |
+| `rollback.sh` | Revert each service to previous task def revision; SNS notification; `ROLLBACK_CONFIRMED=yes` guard for prod |
+| `smoke-test.sh` | Health + API checks on all 4 services; writes `smoke-test-results.json` |
+| `e2e-test.sh` | Full create→telemetry→anomaly→alert→status-update→delete flow with cleanup trap |
+| `cleanup.sh` | Stop ECS services, deregister old task defs (keep last 3), purge untagged ECR images, remove old CloudWatch streams; supports `DRY_RUN=true` |
+
 
 
 ```cmd

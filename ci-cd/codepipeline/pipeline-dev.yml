@@ -1,0 +1,447 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Dev CodePipeline for the Renewable Energy Platform.
+  Triggers on every commit to 'develop' branch. No manual approval.
+  Deploys directly to dev ECS cluster and triggers nightly performance tests via EventBridge.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner/org
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: Renewable-Energy-Platform
+  CodeStarConnectionArn:
+    Type: String
+    Description: ARN of the CodeStar Connection to GitHub
+  EcrRepositoryPrefix:
+    Type: String
+    Description: ECR repository prefix
+    Default: renewable-energy
+  EcsClusterDev:
+    Type: String
+    Description: Dev ECS cluster name
+    Default: renewable-energy-dev
+  ArtifactBucketName:
+    Type: String
+    Description: S3 bucket name for pipeline artifacts
+  NotificationEmail:
+    Type: String
+    Description: Email for failure notifications
+
+Resources:
+
+  # ─── S3 Artifact Bucket ─────────────────────────────────────────────────
+  DevArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ArtifactBucketName}-dev'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDevArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: dev
+
+  # ─── SNS Topic for failure alerts ───────────────────────────────────────
+  DevPipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: renewable-energy-dev-pipeline-notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # ─── CodeBuild — Build ──────────────────────────────────────────────────
+  DevCodeBuildBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-dev-build
+      Description: Build Docker images for dev
+      ServiceRole: !GetAtt DevCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          - Name: ECR_REPOSITORY_PREFIX
+            Value: !Ref EcrRepositoryPrefix
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec.yml
+      TimeoutInMinutes: 60
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+          - LOCAL_SOURCE_CACHE
+
+  # ─── CodeBuild — Tests ──────────────────────────────────────────────────
+  DevCodeBuildTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-dev-test
+      Description: Run tests for dev
+      ServiceRole: !GetAtt DevCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-test.yml
+      TimeoutInMinutes: 30
+
+  # ─── CodeBuild — Deploy Dev ──────────────────────────────────────────────
+  DevCodeBuildDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-dev-deploy
+      Description: Deploy to dev ECS cluster
+      ServiceRole: !GetAtt DevCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: dev
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterDev
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 30
+
+  # ─── CodeBuild — Performance Tests (triggered nightly) ──────────────────
+  DevCodeBuildPerfTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-dev-perf-test
+      Description: Nightly performance tests against dev
+      ServiceRole: !GetAtt DevCodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: dev
+          - Name: TEST_DURATION
+            Value: '120'
+          - Name: VUS
+            Value: '20'
+          - Name: ASSET_URL
+            Value: 'http://renewable-energy-dev.example.com:5001'
+          - Name: TELEMETRY_URL
+            Value: 'http://renewable-energy-dev.example.com:5002'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - K6_VERSION=v0.49.0
+                - curl -fsSL "https://github.com/grafana/k6/releases/download/$K6_VERSION/k6-$K6_VERSION-linux-amd64.tar.gz" | tar -xz --strip-components=1
+                - mv k6 /usr/local/bin/k6
+            build:
+              commands:
+                - echo "Running nightly performance tests against $ENVIRONMENT..."
+                - k6 run
+                    --env ASSET_URL=$ASSET_URL
+                    --env TELEMETRY_URL=$TELEMETRY_URL
+                    --env DURATION=$TEST_DURATION
+                    --env VUS=$VUS
+                    --out json=k6-results.json
+                    ci-cd/k6/performance-test.js || true
+          artifacts:
+            files:
+              - k6-results.json
+      TimeoutInMinutes: 30
+
+  # ─── EventBridge Rule for Nightly Performance Tests ──────────────────────
+  NightlyPerfTestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: renewable-energy-dev-nightly-perf-test
+      Description: Trigger nightly performance tests against dev at 02:00 UTC
+      ScheduleExpression: 'cron(0 2 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: DevPerfTestTarget
+          Arn: !GetAtt DevCodeBuildPerfTest.Arn
+          RoleArn: !GetAtt EventBridgeCodeBuildRole.Arn
+          Input: !Sub |
+            {
+              "environmentVariablesOverride": [
+                {"name": "ENVIRONMENT", "value": "dev", "type": "PLAINTEXT"},
+                {"name": "TEST_DURATION", "value": "120", "type": "PLAINTEXT"},
+                {"name": "VUS", "value": "20", "type": "PLAINTEXT"}
+              ]
+            }
+
+  # ─── Dev Pipeline ────────────────────────────────────────────────────────
+  DevPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: renewable-energy-dev-pipeline
+      RoleArn: !GetAtt DevCodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref DevArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: develop
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: BuildImages
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DevCodeBuildBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+        - Name: Test
+          Actions:
+            - Name: RunTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DevCodeBuildTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: TestArtifact
+              RunOrder: 1
+
+        - Name: Deploy-Dev
+          Actions:
+            - Name: DeployToDev
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DevCodeBuildDeploy
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: DevDeployArtifact
+              RunOrder: 1
+
+      Tags:
+        - Key: Environment
+          Value: dev
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── EventBridge Rule: Pipeline Failure Notification ────────────────────
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: renewable-energy-dev-pipeline-failure
+      Description: Notify on dev pipeline failures
+      EventPattern:
+        source:
+          - 'aws.codepipeline'
+        detail-type:
+          - 'CodePipeline Pipeline Execution State Change'
+        detail:
+          state:
+            - 'FAILED'
+          pipeline:
+            - !Ref DevPipeline
+      State: ENABLED
+      Targets:
+        - Id: DevPipelineFailureSNS
+          Arn: !Ref DevPipelineNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              pipeline: '$.detail.pipeline'
+              state: '$.detail.state'
+              time: '$.time'
+            InputTemplate: '"Dev pipeline <pipeline> failed at <time>. State: <state>"'
+
+  # ─── IAM Roles ──────────────────────────────────────────────────────────
+  DevCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-dev-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DevCodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-dev'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-dev/*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:StopBuild'
+                Resource:
+                  - !GetAtt DevCodeBuildBuild.Arn
+                  - !GetAtt DevCodeBuildTest.Arn
+                  - !GetAtt DevCodeBuildDeploy.Arn
+              - Effect: Allow
+                Action: 'codestar-connections:UseConnection'
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref DevPipelineNotificationTopic
+
+  DevCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-dev-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: DevCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-dev'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-dev/*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:RegisterTaskDefinition'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'ecs-tasks.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/renewable-energy/*'
+
+  EventBridgeCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-dev-eventbridge-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StartCodeBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'codebuild:StartBuild'
+                Resource: !GetAtt DevCodeBuildPerfTest.Arn
+
+Outputs:
+  DevPipelineName:
+    Value: !Ref DevPipeline
+  NightlyPerfTestRuleArn:
+    Value: !GetAtt NightlyPerfTestRule.Arn

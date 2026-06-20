@@ -1,0 +1,321 @@
+name: Security Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 9 * * 1'   # Every Monday at 09:00 UTC
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+jobs:
+  container-scan:
+    name: Trivy container image scan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: asset-service
+            image: renewable-energy/asset-service
+          - service: telemetry-service
+            image: renewable-energy/telemetry-service
+          - service: anomaly-detection-service
+            image: renewable-energy/anomaly-detection-service
+          - service: alert-service
+            image: renewable-energy/alert-service
+          - service: simulator
+            image: renewable-energy/simulator
+          - service: dashboard
+            image: renewable-energy/dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ matrix.service }}
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: scan-target/${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Run Trivy image scan (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: scan-target/${{ matrix.image }}:latest
+          format: 'sarif'
+          output: 'trivy-image-${{ matrix.service }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          scanners: 'vuln,secret'
+
+      - name: Run Trivy image scan (table output for logs)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: scan-target/${{ matrix.image }}:latest
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          ignore-unfixed: true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image-${{ matrix.service }}.sarif
+          category: trivy-image-${{ matrix.service }}
+
+      - name: Upload scan artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-scan-${{ matrix.service }}
+          path: trivy-image-${{ matrix.service }}.sarif
+          retention-days: 30
+
+  sast-scan:
+    name: SAST - CodeQL analysis
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - csharp
+          - python
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-and-quality
+          config: |
+            paths:
+              - services/
+            paths-ignore:
+              - '**/tests/**'
+              - '**/__pycache__/**'
+              - '**/.venv/**'
+
+      - name: Setup .NET 9 (for C# analysis)
+        if: matrix.language == 'csharp'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build .NET for CodeQL (C#)
+        if: matrix.language == 'csharp'
+        working-directory: services/asset-service
+        run: |
+          dotnet restore
+          dotnet build --no-restore --configuration Release
+
+      - name: Setup Python (for Python analysis)
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies (for Python analysis)
+        if: matrix.language == 'python'
+        run: |
+          for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+            if [ -f "services/$SERVICE/requirements.txt" ]; then
+              pip install -r "services/$SERVICE/requirements.txt" || true
+            fi
+          done
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-${{ matrix.language }}
+          output: codeql-${{ matrix.language }}-results.sarif
+          upload: true
+
+      - name: Upload CodeQL artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codeql-results-${{ matrix.language }}
+          path: codeql-${{ matrix.language }}-results.sarif
+          retention-days: 30
+
+  dependency-scan:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install safety
+        run: pip install safety
+
+      - name: Run safety check on Python services
+        run: |
+          OVERALL_PASS=true
+          mkdir -p security-reports/dependency
+
+          for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+            REQ_FILE="services/$SERVICE/requirements.txt"
+            if [ -f "$REQ_FILE" ]; then
+              echo "=== Scanning $SERVICE dependencies ==="
+              safety check \
+                -r "$REQ_FILE" \
+                --json \
+                --output "security-reports/dependency/safety-$SERVICE.json" || OVERALL_PASS=false
+              safety check \
+                -r "$REQ_FILE" \
+                --short-report || true
+            else
+              echo "No requirements.txt found for $SERVICE"
+            fi
+          done
+
+          if [ "$OVERALL_PASS" = "false" ]; then
+            echo "WARNING: Vulnerable Python dependencies found. Review security-reports/dependency/"
+          fi
+
+      - name: Restore .NET dependencies
+        working-directory: services/asset-service
+        run: dotnet restore
+
+      - name: Check .NET packages for vulnerabilities
+        working-directory: services/asset-service
+        run: |
+          echo "=== Checking .NET packages for vulnerabilities ==="
+          dotnet list package --vulnerable --include-transitive 2>&1 | tee ../security-reports/dependency/dotnet-vulnerable.txt || true
+          if grep -q "has the following vulnerable packages" ../security-reports/dependency/dotnet-vulnerable.txt 2>/dev/null; then
+            echo "WARNING: Vulnerable .NET packages found."
+            cat ../security-reports/dependency/dotnet-vulnerable.txt
+          else
+            echo "No known vulnerable .NET packages found."
+          fi
+        working-directory: services/asset-service
+
+      - name: Upload dependency scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-scan-results
+          path: security-reports/dependency/
+          retention-days: 30
+
+  secrets-scan:
+    name: Secrets scan with TruffleHog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog filesystem scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: >
+            --only-verified
+            --json
+            --exclude-paths=.trufflehog-ignore
+
+      - name: Run TruffleHog on all history (scheduled scan only)
+        if: github.event_name == 'schedule'
+        run: |
+          docker run --rm \
+            -v "$(pwd):/repo" \
+            ghcr.io/trufflesecurity/trufflehog:latest \
+            git \
+            file:///repo \
+            --only-verified \
+            --json \
+            2>&1 | tee trufflehog-full-scan.json || true
+
+          SECRETS_FOUND=$(cat trufflehog-full-scan.json | grep -c '"SourceMetadata"' || echo 0)
+          echo "Potential secrets found in history: $SECRETS_FOUND"
+          if [ "$SECRETS_FOUND" -gt 0 ]; then
+            echo "WARNING: Potential secrets detected in git history. Review trufflehog-full-scan.json"
+          fi
+
+      - name: Upload TruffleHog results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secrets-scan-results
+          path: |
+            trufflehog-full-scan.json
+          retention-days: 30
+
+  aggregate-results:
+    name: Aggregate security findings
+    runs-on: ubuntu-latest
+    needs:
+      - container-scan
+      - sast-scan
+      - dependency-scan
+      - secrets-scan
+    if: always()
+    steps:
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-security-results/
+
+      - name: Generate security summary
+        run: |
+          echo "# Security Scan Summary" > security-summary.md
+          echo "Date: $(date -u)" >> security-summary.md
+          echo "Commit: ${{ github.sha }}" >> security-summary.md
+          echo "" >> security-summary.md
+
+          echo "## Job Results" >> security-summary.md
+          echo "- Container Scan: ${{ needs.container-scan.result }}" >> security-summary.md
+          echo "- SAST Scan: ${{ needs.sast-scan.result }}" >> security-summary.md
+          echo "- Dependency Scan: ${{ needs.dependency-scan.result }}" >> security-summary.md
+          echo "- Secrets Scan: ${{ needs.secrets-scan.result }}" >> security-summary.md
+          echo "" >> security-summary.md
+
+          echo "## Artifact Listing" >> security-summary.md
+          find all-security-results/ -type f | sort >> security-summary.md
+
+          cat security-summary.md
+
+      - name: Upload security summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-summary
+          path: security-summary.md
+          retention-days: 90

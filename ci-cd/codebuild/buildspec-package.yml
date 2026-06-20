@@ -1,0 +1,346 @@
+version: 0.2
+
+env:
+  variables:
+    HELM_VERSION: "3.13.2"
+    KUBECTL_VERSION: "1.28.3"
+    CHARTS_S3_PREFIX: "helm-charts"
+    MANIFESTS_S3_PREFIX: "deployment-manifests"
+  parameter-store:
+    AWS_ACCOUNT_ID: "/renewable-energy/aws-account-id"
+    ECR_REGISTRY: "/renewable-energy/ecr-registry"
+    ARTIFACTS_BUCKET: "/renewable-energy/artifacts-bucket"
+    AWS_DEFAULT_REGION: "/renewable-energy/aws-region"
+
+phases:
+  install:
+    commands:
+      - echo "=== Installing Helm and kubectl ==="
+
+      # Install Helm
+      - echo "Installing Helm $HELM_VERSION..."
+      - wget -q "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -O /tmp/helm.tar.gz
+      - tar -xzf /tmp/helm.tar.gz -C /tmp
+      - mv /tmp/linux-amd64/helm /usr/local/bin/helm
+      - chmod +x /usr/local/bin/helm
+      - helm version
+
+      # Install kubectl
+      - echo "Installing kubectl $KUBECTL_VERSION..."
+      - wget -q "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+          -O /usr/local/bin/kubectl
+      - chmod +x /usr/local/bin/kubectl
+      - kubectl version --client
+
+      # Install yq for YAML manipulation
+      - wget -q "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" \
+          -O /usr/local/bin/yq
+      - chmod +x /usr/local/bin/yq
+      - yq --version
+
+      # Install Python for scripting
+      - pip install --upgrade pip boto3 pyyaml
+
+  pre_build:
+    commands:
+      - echo "=== Pre-build: Setting up packaging environment ==="
+      - IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-8)
+      - export IMAGE_TAG
+      - echo "Packaging version: $IMAGE_TAG"
+      - mkdir -p packaged-charts deployment-manifests
+
+  build:
+    commands:
+      - echo "=== Build phase: Packaging Helm charts and deployment manifests ==="
+
+      # ─── Package Helm charts for each service ────────────────────────────
+      - echo "--- Packaging Helm charts ---"
+      - |
+        SERVICES="asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard"
+        for SERVICE in $SERVICES; do
+          CHART_DIR="helm/$SERVICE"
+          if [ ! -d "$CHART_DIR" ]; then
+            echo "No Helm chart found at $CHART_DIR, generating default chart..."
+            # Generate a default chart structure if it doesn't exist
+            helm create "$CHART_DIR"
+            # Override values with service-specific defaults
+            cat > "$CHART_DIR/values.yaml" << VALEOF
+        replicaCount: 2
+
+        image:
+          repository: ${ECR_REGISTRY}/renewable-energy/${SERVICE}
+          pullPolicy: IfNotPresent
+          tag: "${IMAGE_TAG}"
+
+        service:
+          type: ClusterIP
+          port: 80
+
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+        autoscaling:
+          enabled: true
+          minReplicas: 2
+          maxReplicas: 10
+          targetCPUUtilizationPercentage: 70
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 5
+
+        nodeSelector:
+          kubernetes.io/os: linux
+
+        tolerations: []
+
+        affinity: {}
+
+        serviceAccount:
+          create: true
+          name: ""
+        VALEOF
+          fi
+
+          # Update Chart.yaml with current version
+          if [ -f "$CHART_DIR/Chart.yaml" ]; then
+            yq e ".version = \"0.1.$BUILD_NUMBER\"" -i "$CHART_DIR/Chart.yaml" 2>/dev/null || true
+            yq e ".appVersion = \"$IMAGE_TAG\"" -i "$CHART_DIR/Chart.yaml" 2>/dev/null || true
+          fi
+
+          echo "Packaging Helm chart for $SERVICE..."
+          helm package "$CHART_DIR" \
+            --version "0.1.${BUILD_NUMBER:-0}" \
+            --app-version "$IMAGE_TAG" \
+            --destination packaged-charts/ \
+            2>&1
+
+          echo "Packaged $SERVICE chart."
+        done
+
+      # ─── Push Helm charts to S3 ───────────────────────────────────────────
+      - echo "--- Pushing Helm charts to S3 ---"
+      - |
+        for CHART_FILE in packaged-charts/*.tgz; do
+          if [ -f "$CHART_FILE" ]; then
+            CHART_NAME=$(basename "$CHART_FILE")
+            S3_KEY="$CHARTS_S3_PREFIX/$IMAGE_TAG/$CHART_NAME"
+            echo "Uploading $CHART_NAME to s3://$ARTIFACTS_BUCKET/$S3_KEY..."
+            aws s3 cp "$CHART_FILE" "s3://$ARTIFACTS_BUCKET/$S3_KEY" \
+              --region "$AWS_DEFAULT_REGION" \
+              --metadata "build-id=$CODEBUILD_BUILD_ID,commit=$IMAGE_TAG"
+            echo "Uploaded $CHART_NAME."
+          fi
+        done
+
+        # Update Helm chart index in S3
+        echo "Updating Helm chart index..."
+        aws s3 sync "s3://$ARTIFACTS_BUCKET/$CHARTS_S3_PREFIX/" /tmp/helm-repo/ \
+          --region "$AWS_DEFAULT_REGION" 2>/dev/null || mkdir -p /tmp/helm-repo/
+        cp packaged-charts/*.tgz /tmp/helm-repo/ 2>/dev/null || true
+        helm repo index /tmp/helm-repo/ \
+          --url "https://$ARTIFACTS_BUCKET.s3.$AWS_DEFAULT_REGION.amazonaws.com/$CHARTS_S3_PREFIX/"
+        aws s3 cp /tmp/helm-repo/index.yaml \
+          "s3://$ARTIFACTS_BUCKET/$CHARTS_S3_PREFIX/index.yaml" \
+          --region "$AWS_DEFAULT_REGION"
+        echo "Helm chart index updated."
+
+      # ─── Generate deployment manifests ───────────────────────────────────
+      - echo "--- Generating deployment manifests ---"
+      - |
+        python3 << 'PYEOF'
+        import json
+        import os
+        import yaml
+        from datetime import datetime, timezone
+
+        IMAGE_TAG = os.environ.get("IMAGE_TAG", "latest")
+        ECR_REGISTRY = os.environ.get("ECR_REGISTRY", "")
+        REPO_PREFIX = "renewable-energy"
+        ENVIRONMENTS = ["dev", "staging", "prod"]
+
+        SERVICES = {
+            "asset-service": {"port": 5001, "replicas": {"dev": 1, "staging": 2, "prod": 3}},
+            "telemetry-service": {"port": 5002, "replicas": {"dev": 1, "staging": 2, "prod": 3}},
+            "anomaly-detection-service": {"port": 5003, "replicas": {"dev": 1, "staging": 2, "prod": 2}},
+            "alert-service": {"port": 5004, "replicas": {"dev": 1, "staging": 2, "prod": 2}},
+            "simulator": {"port": None, "replicas": {"dev": 1, "staging": 1, "prod": 1}},
+            "dashboard": {"port": 3000, "replicas": {"dev": 1, "staging": 2, "prod": 3}},
+        }
+
+        os.makedirs("deployment-manifests", exist_ok=True)
+
+        for env in ENVIRONMENTS:
+            env_dir = f"deployment-manifests/{env}"
+            os.makedirs(env_dir, exist_ok=True)
+            all_manifests = []
+
+            for service, config in SERVICES.items():
+                image = f"{ECR_REGISTRY}/{REPO_PREFIX}/{service}:{IMAGE_TAG}"
+                replicas = config["replicas"][env]
+                port = config["port"]
+
+                # Deployment manifest
+                deployment = {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": service,
+                        "namespace": f"renewable-energy-{env}",
+                        "labels": {
+                            "app": service,
+                            "environment": env,
+                            "version": IMAGE_TAG,
+                        },
+                        "annotations": {
+                            "deployment.kubernetes.io/revision": "1",
+                            "renewable-energy/build-date": datetime.now(timezone.utc).isoformat(),
+                        }
+                    },
+                    "spec": {
+                        "replicas": replicas,
+                        "selector": {"matchLabels": {"app": service}},
+                        "strategy": {
+                            "type": "RollingUpdate",
+                            "rollingUpdate": {"maxSurge": 1, "maxUnavailable": 0}
+                        },
+                        "template": {
+                            "metadata": {"labels": {"app": service, "version": IMAGE_TAG}},
+                            "spec": {
+                                "containers": [{
+                                    "name": service,
+                                    "image": image,
+                                    "imagePullPolicy": "Always",
+                                    "ports": [{"containerPort": port or 8080}] if port else [],
+                                    "env": [
+                                        {"name": "ENVIRONMENT", "value": env},
+                                        {"name": "SERVICE_NAME", "value": service},
+                                    ],
+                                    "resources": {
+                                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                                        "limits": {"cpu": "500m", "memory": "512Mi"}
+                                    },
+                                    "livenessProbe": {
+                                        "httpGet": {"path": "/health", "port": port or 8080},
+                                        "initialDelaySeconds": 30,
+                                        "periodSeconds": 10
+                                    } if port else None,
+                                    "readinessProbe": {
+                                        "httpGet": {"path": "/health", "port": port or 8080},
+                                        "initialDelaySeconds": 15,
+                                        "periodSeconds": 5
+                                    } if port else None,
+                                }]
+                            }
+                        }
+                    }
+                }
+
+                # Remove None values
+                container = deployment["spec"]["template"]["spec"]["containers"][0]
+                if not container.get("livenessProbe"):
+                    container.pop("livenessProbe", None)
+                if not container.get("readinessProbe"):
+                    container.pop("readinessProbe", None)
+
+                all_manifests.append(deployment)
+
+                # Service manifest (skip for simulator which has no port)
+                if port:
+                    svc = {
+                        "apiVersion": "v1",
+                        "kind": "Service",
+                        "metadata": {
+                            "name": service,
+                            "namespace": f"renewable-energy-{env}",
+                            "labels": {"app": service, "environment": env}
+                        },
+                        "spec": {
+                            "selector": {"app": service},
+                            "ports": [{"port": port, "targetPort": port, "protocol": "TCP"}],
+                            "type": "ClusterIP"
+                        }
+                    }
+                    all_manifests.append(svc)
+
+            # Write combined manifest file
+            with open(f"{env_dir}/all-services.yaml", "w") as fh:
+                for i, manifest in enumerate(all_manifests):
+                    if i > 0:
+                        fh.write("---\n")
+                    yaml.dump(manifest, fh, default_flow_style=False)
+
+            # Write image definitions for ECS
+            image_defs = [
+                {"name": svc, "imageUri": f"{ECR_REGISTRY}/{REPO_PREFIX}/{svc}:{IMAGE_TAG}"}
+                for svc in SERVICES.keys()
+            ]
+            with open(f"{env_dir}/imagedefinitions.json", "w") as fh:
+                json.dump(image_defs, fh, indent=2)
+
+            print(f"Generated manifests for {env}")
+
+        print("All deployment manifests generated.")
+        PYEOF
+
+      # ─── Upload manifests to S3 ───────────────────────────────────────────
+      - echo "--- Uploading deployment manifests to S3 ---"
+      - |
+        aws s3 sync deployment-manifests/ \
+          "s3://$ARTIFACTS_BUCKET/$MANIFESTS_S3_PREFIX/$IMAGE_TAG/" \
+          --region "$AWS_DEFAULT_REGION" \
+          --delete \
+          --metadata "build-id=$CODEBUILD_BUILD_ID,commit=$IMAGE_TAG"
+        echo "Deployment manifests uploaded."
+
+        # Also upload as 'latest'
+        aws s3 sync deployment-manifests/ \
+          "s3://$ARTIFACTS_BUCKET/$MANIFESTS_S3_PREFIX/latest/" \
+          --region "$AWS_DEFAULT_REGION" \
+          --delete
+        echo "Manifests also uploaded as 'latest'."
+
+  post_build:
+    commands:
+      - echo "=== Post-build: Package summary ==="
+      - |
+        echo "Packaged Helm charts:"
+        ls -la packaged-charts/
+
+        echo ""
+        echo "Generated deployment manifests:"
+        find deployment-manifests/ -name "*.yaml" -o -name "*.json" | sort
+
+        echo ""
+        echo "S3 uploads:"
+        aws s3 ls "s3://$ARTIFACTS_BUCKET/$CHARTS_S3_PREFIX/$IMAGE_TAG/" --region "$AWS_DEFAULT_REGION" || true
+        aws s3 ls "s3://$ARTIFACTS_BUCKET/$MANIFESTS_S3_PREFIX/$IMAGE_TAG/" \
+          --region "$AWS_DEFAULT_REGION" --recursive || true
+
+        echo "Packaging complete."
+
+artifacts:
+  files:
+    - packaged-charts/**/*
+    - deployment-manifests/**/*
+  name: PackageArtifacts
+  discard-paths: no
+
+cache:
+  paths:
+    - '/tmp/helm-cache/**/*'

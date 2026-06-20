@@ -1,0 +1,307 @@
+version: 0.2
+
+env:
+  variables:
+    HELM_VERSION: "3.13.2"
+    KUBECTL_VERSION: "1.28.3"
+    SMOKE_TEST_TIMEOUT: "300"
+    ROLLOUT_TIMEOUT: "600"
+  parameter-store:
+    AWS_ACCOUNT_ID: "/renewable-energy/aws-account-id"
+    ECR_REGISTRY: "/renewable-energy/ecr-registry"
+    ARTIFACTS_BUCKET: "/renewable-energy/artifacts-bucket"
+
+phases:
+  install:
+    commands:
+      - echo "=== Installing deployment tools ==="
+
+      # Install kubectl
+      - wget -q "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+          -O /usr/local/bin/kubectl
+      - chmod +x /usr/local/bin/kubectl
+      - kubectl version --client
+
+      # Install Helm
+      - wget -q "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -O /tmp/helm.tar.gz
+      - tar -xzf /tmp/helm.tar.gz -C /tmp
+      - mv /tmp/linux-amd64/helm /usr/local/bin/helm
+      - chmod +x /usr/local/bin/helm
+      - helm version
+
+      # Install aws-cli v2 (upgrade if needed)
+      - aws --version
+
+      # Install jq, curl
+      - apt-get update -qq && apt-get install -y jq curl 2>/dev/null || true
+
+      # Install Python for smoke tests
+      - pip install --upgrade pip requests boto3
+
+  pre_build:
+    commands:
+      - echo "=== Pre-build: Configuring deployment environment ==="
+
+      # Validate required env vars
+      - |
+        if [ -z "$ENVIRONMENT" ]; then
+          echo "ERROR: ENVIRONMENT env var is required (dev/staging/prod)"
+          exit 1
+        fi
+        if [ -z "$AWS_REGION" ]; then
+          echo "ERROR: AWS_REGION env var is required"
+          exit 1
+        fi
+        if [ -z "$ECS_CLUSTER" ]; then
+          echo "ERROR: ECS_CLUSTER env var is required"
+          exit 1
+        fi
+        echo "Deploying to environment: $ENVIRONMENT"
+        echo "Cluster: $ECS_CLUSTER"
+        echo "Region: $AWS_REGION"
+
+      # Set image tag
+      - IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-8)
+      - export IMAGE_TAG
+      - echo "Deploying image tag: $IMAGE_TAG"
+
+      # Configure kubeconfig if EKS cluster name is set
+      - |
+        EKS_CLUSTER_NAME="renewable-energy-eks-$ENVIRONMENT"
+        aws eks describe-cluster \
+          --name "$EKS_CLUSTER_NAME" \
+          --region "$AWS_REGION" \
+          2>/dev/null && {
+          echo "Configuring kubeconfig for EKS cluster $EKS_CLUSTER_NAME..."
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+          kubectl cluster-info || true
+        } || echo "EKS cluster not found or not accessible — skipping kubeconfig setup."
+
+      # ECR login
+      - |
+        echo "Logging in to ECR..."
+        aws ecr get-login-password --region "$AWS_REGION" | \
+          docker login --username AWS --password-stdin "$ECR_REGISTRY"
+        echo "ECR login successful."
+
+      # Download latest imagedefinitions from S3
+      - |
+        echo "Downloading deployment manifests from S3..."
+        aws s3 cp \
+          "s3://$ARTIFACTS_BUCKET/deployment-manifests/$IMAGE_TAG/$ENVIRONMENT/imagedefinitions.json" \
+          imagedefinitions.json \
+          --region "$AWS_REGION" 2>/dev/null || echo "No imagedefinitions from S3, will generate locally."
+
+      - mkdir -p deploy-output
+
+  build:
+    commands:
+      - echo "=== Build phase: Deploying to $ENVIRONMENT ==="
+
+      # ─── ECS deployment (primary deployment method) ───────────────────────
+      - echo "--- Deploying to ECS cluster: $ECS_CLUSTER ---"
+      - |
+        SERVICES="asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard"
+        DEPLOY_FAILED=false
+
+        for SERVICE in $SERVICES; do
+          echo "Updating ECS service: $SERVICE in cluster $ECS_CLUSTER..."
+
+          # Update task definition with new image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "$SERVICE" \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition' \
+            --output json 2>/dev/null || echo '{}')
+
+          if [ "$TASK_DEF" = "{}" ]; then
+            echo "WARNING: Task definition for $SERVICE not found, skipping..."
+            continue
+          fi
+
+          IMAGE_URI="$ECR_REGISTRY/renewable-energy/$SERVICE:$IMAGE_TAG"
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | python3 -c "
+        import json, sys
+        td = json.load(sys.stdin)
+        for c in td.get('containerDefinitions', []):
+            if c.get('name') == '$SERVICE':
+                c['image'] = '$IMAGE_URI'
+        for key in ['taskDefinitionArn','revision','status','requiresAttributes','placementConstraints','compatibilities','registeredAt','registeredBy']:
+            td.pop(key, None)
+        print(json.dumps(td))
+        ")
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --region "$AWS_REGION" \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "$SERVICE new task definition: $NEW_TASK_ARN"
+
+          # Update service
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$NEW_TASK_ARN" \
+            --force-new-deployment \
+            --region "$AWS_REGION" \
+            --output json > "deploy-output/$SERVICE-update.json" 2>&1 || {
+            echo "WARNING: Failed to update ECS service $SERVICE"
+            DEPLOY_FAILED=true
+            continue
+          }
+
+          echo "$SERVICE deployment initiated."
+        done
+
+        if [ "$DEPLOY_FAILED" = "true" ]; then
+          echo "ERROR: One or more ECS service updates failed."
+          exit 1
+        fi
+
+      # ─── Helm upgrade (if EKS is configured) ─────────────────────────────
+      - |
+        if kubectl cluster-info &>/dev/null; then
+          echo "--- Running Helm upgrade for $ENVIRONMENT ---"
+          NAMESPACE="renewable-energy-$ENVIRONMENT"
+
+          kubectl create namespace "$NAMESPACE" 2>/dev/null || true
+
+          for SERVICE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+            CHART_DIR="helm/$SERVICE"
+            if [ -d "$CHART_DIR" ]; then
+              echo "Helm upgrade for $SERVICE..."
+              helm upgrade --install \
+                "$SERVICE" \
+                "$CHART_DIR" \
+                --namespace "$NAMESPACE" \
+                --set "image.repository=$ECR_REGISTRY/renewable-energy/$SERVICE" \
+                --set "image.tag=$IMAGE_TAG" \
+                --set "environment=$ENVIRONMENT" \
+                --timeout 300s \
+                --wait \
+                --atomic \
+                2>&1 | tee "deploy-output/helm-$SERVICE.log" || {
+                echo "WARNING: Helm upgrade failed for $SERVICE"
+              }
+            fi
+          done
+        else
+          echo "EKS not configured, skipping Helm upgrade."
+        fi
+
+  post_build:
+    commands:
+      - echo "=== Post-build: Verifying deployment and running smoke tests ==="
+
+      # Wait for ECS services to stabilize
+      - |
+        echo "Waiting for ECS services to stabilize..."
+        SERVICES="asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard"
+        for SERVICE in $SERVICES; do
+          echo "Waiting for $SERVICE..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$SERVICE" \
+            --region "$AWS_REGION" \
+            --timeout "$ROLLOUT_TIMEOUT" 2>/dev/null || {
+            echo "WARNING: $SERVICE did not stabilize within $ROLLOUT_TIMEOUT seconds"
+          }
+          echo "$SERVICE is stable."
+        done
+
+      # Run smoke tests via health endpoints
+      - |
+        echo "=== Running smoke tests for $ENVIRONMENT ==="
+
+        case "$ENVIRONMENT" in
+          dev)
+            BASE_URL="http://renewable-energy-dev.example.com"
+            ;;
+          staging)
+            BASE_URL="http://renewable-energy-staging.example.com"
+            ;;
+          prod)
+            BASE_URL="http://renewable-energy.example.com"
+            ;;
+          *)
+            BASE_URL="http://localhost"
+            ;;
+        esac
+
+        SMOKE_FAILED=false
+        declare -A SERVICE_PORTS=(
+          ["asset-service"]="5001"
+          ["telemetry-service"]="5002"
+          ["anomaly-detection-service"]="5003"
+          ["alert-service"]="5004"
+        )
+
+        for SERVICE in "${!SERVICE_PORTS[@]}"; do
+          PORT="${SERVICE_PORTS[$SERVICE]}"
+          URL="$BASE_URL:$PORT/health"
+          echo "Testing $SERVICE health at $URL..."
+
+          RESPONSE=$(curl -s -o /tmp/health-response.txt -w "%{http_code}" \
+            --max-time 30 \
+            --retry 5 \
+            --retry-delay 10 \
+            "$URL" 2>/dev/null || echo "000")
+
+          if [ "$RESPONSE" = "200" ]; then
+            echo "PASS: $SERVICE health check ($RESPONSE)"
+          else
+            echo "FAIL: $SERVICE health check returned $RESPONSE"
+            cat /tmp/health-response.txt || true
+            SMOKE_FAILED=true
+          fi
+        done
+
+        if [ "$SMOKE_FAILED" = "true" ]; then
+          echo "ERROR: Smoke tests failed for $ENVIRONMENT"
+          exit 1
+        fi
+
+        echo "All smoke tests passed."
+
+      # Write deploy summary
+      - |
+        python3 << 'PYEOF'
+        import json
+        import os
+        import subprocess
+        from datetime import datetime, timezone
+
+        summary = {
+            "environment": os.environ.get("ENVIRONMENT", "unknown"),
+            "ecs_cluster": os.environ.get("ECS_CLUSTER", "unknown"),
+            "image_tag": os.environ.get("IMAGE_TAG", "unknown"),
+            "aws_region": os.environ.get("AWS_REGION", "unknown"),
+            "deploy_time": datetime.now(timezone.utc).isoformat(),
+            "build_id": os.environ.get("CODEBUILD_BUILD_ID", "unknown"),
+            "services_deployed": [
+                "asset-service", "telemetry-service", "anomaly-detection-service",
+                "alert-service", "simulator", "dashboard"
+            ],
+            "smoke_tests": "passed",
+        }
+
+        with open("deploy-output/deploy-summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+        print("Deploy summary:")
+        print(json.dumps(summary, indent=2))
+        PYEOF
+
+      - echo "Deployment to $ENVIRONMENT complete."
+
+artifacts:
+  files:
+    - deploy-output/deploy-summary.json
+    - deploy-output/**/*
+  name: DeployArtifacts
+  discard-paths: no

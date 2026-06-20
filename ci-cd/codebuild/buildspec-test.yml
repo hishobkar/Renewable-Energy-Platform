@@ -1,0 +1,212 @@
+version: 0.2
+
+env:
+  variables:
+    DOTNET_VERSION: "9.0"
+    PYTHON_VERSION: "3.11"
+    COVERAGE_THRESHOLD: "70"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.11"
+    commands:
+      - echo "=== Installing test dependencies ==="
+
+      # Install .NET 9 SDK
+      - wget -q https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+      - dpkg -i packages-microsoft-prod.deb
+      - apt-get update -qq
+      - apt-get install -y dotnet-sdk-9.0 2>/dev/null || true
+      - |
+        if ! command -v dotnet &>/dev/null; then
+          curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 9.0 --install-dir /usr/local/dotnet
+          export PATH="$PATH:/usr/local/dotnet"
+        fi
+      - dotnet --version
+
+      # Install Python 3.11 test tools
+      - pip install --upgrade pip
+      - pip install \
+          pytest==7.4.3 \
+          pytest-cov==4.1.0 \
+          pytest-asyncio==0.21.1 \
+          pytest-html==4.1.1 \
+          coverage==7.3.2 \
+          flake8==6.1.0 \
+          httpx==0.25.2 \
+          anyio==4.1.0
+
+      # Install service Python dependencies
+      - |
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          if [ -f "services/$SERVICE/requirements.txt" ]; then
+            echo "Installing deps for $SERVICE..."
+            pip install -q -r "services/$SERVICE/requirements.txt"
+          fi
+        done
+
+  build:
+    commands:
+      - echo "=== Build phase: Running all tests ==="
+      - mkdir -p test-results coverage-reports
+
+      # ─── .NET tests with coverage ───────────────────────────────────────
+      - echo "--- Running .NET tests ---"
+      - |
+        cd services/asset-service
+        dotnet restore --verbosity quiet
+
+        dotnet test \
+          --no-restore \
+          --configuration Release \
+          --logger "trx;LogFileName=../../test-results/dotnet-test-results.trx" \
+          --logger "console;verbosity=normal" \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ../../test-results/dotnet \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+
+        echo ".NET tests passed."
+        cd ../..
+
+      # ─── Python flake8 linting ───────────────────────────────────────────
+      - echo "--- Running flake8 on Python services ---"
+      - |
+        FLAKE8_FAILED=false
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          echo "Linting $SERVICE..."
+          flake8 "services/$SERVICE" \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=__pycache__,.venv,venv \
+            --format=pylint \
+            --output-file="test-results/flake8-$SERVICE.txt" || FLAKE8_FAILED=true
+          if [ -s "test-results/flake8-$SERVICE.txt" ]; then
+            echo "Flake8 issues in $SERVICE:"
+            cat "test-results/flake8-$SERVICE.txt"
+          else
+            echo "No flake8 issues in $SERVICE."
+          fi
+        done
+        if [ "$FLAKE8_FAILED" = "true" ]; then
+          echo "WARNING: Flake8 linting issues found."
+        fi
+
+      # ─── Python pytest with coverage ─────────────────────────────────────
+      - echo "--- Running Python tests with coverage ---"
+      - |
+        PYTEST_FAILED=false
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          echo "=== Testing $SERVICE ==="
+          cd "services/$SERVICE"
+
+          if [ ! -d tests ]; then
+            echo "No tests directory for $SERVICE, skipping."
+            cd ../..
+            continue
+          fi
+
+          python3 -m pytest \
+            tests/ \
+            --tb=short \
+            -q \
+            --cov=. \
+            --cov-report=xml:"../../coverage-reports/coverage-$SERVICE.xml" \
+            --cov-report=html:"../../coverage-reports/html-$SERVICE" \
+            --cov-report=term-missing \
+            --cov-fail-under=$COVERAGE_THRESHOLD \
+            --junitxml="../../test-results/pytest-$SERVICE.xml" \
+            -v \
+            2>&1 | tee "../../test-results/pytest-$SERVICE.log" || PYTEST_FAILED=true
+
+          echo "Coverage for $SERVICE:"
+          python3 -m coverage report --include="*.py" --omit="tests/*,*/__init__.py" || true
+
+          cd ../..
+        done
+
+        if [ "$PYTEST_FAILED" = "true" ]; then
+          echo "ERROR: One or more Python test suites failed."
+          exit 1
+        fi
+
+  post_build:
+    commands:
+      - echo "=== Post-build: Generating coverage reports ==="
+
+      # Combine Python coverage reports into summary
+      - |
+        echo "=== Coverage Summary ===" > coverage-reports/summary.txt
+        echo "Date: $(date -u)" >> coverage-reports/summary.txt
+        echo "" >> coverage-reports/summary.txt
+
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          if [ -f "coverage-reports/coverage-$SERVICE.xml" ]; then
+            echo "--- $SERVICE ---" >> coverage-reports/summary.txt
+            python3 -c "
+        import xml.etree.ElementTree as ET
+        tree = ET.parse('coverage-reports/coverage-$SERVICE.xml')
+        root = tree.getroot()
+        line_rate = float(root.attrib.get('line-rate', 0)) * 100
+        branch_rate = float(root.attrib.get('branch-rate', 0)) * 100
+        print(f'  Line coverage:   {line_rate:.1f}%')
+        print(f'  Branch coverage: {branch_rate:.1f}%')
+        " >> coverage-reports/summary.txt 2>/dev/null || echo "  (Could not parse coverage XML)" >> coverage-reports/summary.txt
+          fi
+        done
+
+        # .NET coverage summary
+        echo "" >> coverage-reports/summary.txt
+        echo "--- asset-service (.NET) ---" >> coverage-reports/summary.txt
+        DOTNET_COVERAGE=$(find test-results/dotnet -name "coverage.cobertura.xml" | head -1)
+        if [ -f "$DOTNET_COVERAGE" ]; then
+          python3 -c "
+        import xml.etree.ElementTree as ET
+        tree = ET.parse('$DOTNET_COVERAGE')
+        root = tree.getroot()
+        line_rate = float(root.attrib.get('line-rate', 0)) * 100
+        branch_rate = float(root.attrib.get('branch-rate', 0)) * 100
+        print(f'  Line coverage:   {line_rate:.1f}%')
+        print(f'  Branch coverage: {branch_rate:.1f}%')
+        " >> coverage-reports/summary.txt 2>/dev/null || echo "  (Could not parse .NET coverage XML)" >> coverage-reports/summary.txt
+        fi
+
+        cat coverage-reports/summary.txt
+        echo "=== Test phase complete ==="
+
+artifacts:
+  files:
+    - test-results/**/*
+    - coverage-reports/**/*
+  name: TestArtifacts
+  discard-paths: no
+
+reports:
+  DotNetTestReport:
+    files:
+      - 'test-results/dotnet-test-results.trx'
+    file-format: VisualStudioTrx
+    success-feedback-enabled: true
+    failure-feedback-enabled: true
+
+  PythonTestReport:
+    files:
+      - 'test-results/pytest-*.xml'
+    file-format: JunitXml
+    success-feedback-enabled: true
+    failure-feedback-enabled: true
+
+  DotNetCoverageReport:
+    files:
+      - 'test-results/dotnet/**/coverage.cobertura.xml'
+    file-format: CoberturaXml
+
+  PythonCoverageReport:
+    files:
+      - 'coverage-reports/coverage-*.xml'
+    file-format: CoberturaXml
+
+cache:
+  paths:
+    - '/root/.nuget/packages/**/*'
+    - '/root/.cache/pip/**/*'

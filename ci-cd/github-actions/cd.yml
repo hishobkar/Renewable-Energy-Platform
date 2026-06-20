@@ -1,0 +1,330 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    name: Build and push images to ECR
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: asset-service
+            image: renewable-energy/asset-service
+          - service: telemetry-service
+            image: renewable-energy/telemetry-service
+          - service: anomaly-detection-service
+            image: renewable-energy/anomaly-detection-service
+          - service: alert-service
+            image: renewable-energy/alert-service
+          - service: simulator
+            image: renewable-energy/simulator
+          - service: dashboard
+            image: renewable-energy/dashboard
+    outputs:
+      asset_service_image: ${{ steps.image-uri.outputs.asset_service_image }}
+      telemetry_service_image: ${{ steps.image-uri.outputs.telemetry_service_image }}
+      anomaly_detection_image: ${{ steps.image-uri.outputs.anomaly_detection_image }}
+      alert_service_image: ${{ steps.image-uri.outputs.alert_service_image }}
+      simulator_image: ${{ steps.image-uri.outputs.simulator_image }}
+      dashboard_image: ${{ steps.image-uri.outputs.dashboard_image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ matrix.image }}" \
+            --region "${{ env.AWS_REGION }}" 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name "${{ matrix.image }}" \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ matrix.service }}
+          file: services/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          build-args: |
+            BUILD_VERSION=${{ env.IMAGE_TAG }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+      - name: Output image URI
+        id: image-uri
+        run: |
+          SERVICE_KEY=$(echo "${{ matrix.service }}" | tr '-' '_')
+          echo "${SERVICE_KEY}_image=${{ env.ECR_REGISTRY }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: dev
+      url: http://renewable-energy-dev.example.com
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy asset-service to dev
+        run: |
+          aws ecs update-service \
+            --cluster renewable-energy-dev \
+            --service asset-service \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Deploy telemetry-service to dev
+        run: |
+          aws ecs update-service \
+            --cluster renewable-energy-dev \
+            --service telemetry-service \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Deploy anomaly-detection-service to dev
+        run: |
+          aws ecs update-service \
+            --cluster renewable-energy-dev \
+            --service anomaly-detection-service \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Deploy alert-service to dev
+        run: |
+          aws ecs update-service \
+            --cluster renewable-energy-dev \
+            --service alert-service \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Deploy simulator to dev
+        run: |
+          aws ecs update-service \
+            --cluster renewable-energy-dev \
+            --service simulator \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Deploy dashboard to dev
+        run: |
+          aws ecs update-service \
+            --cluster renewable-energy-dev \
+            --service dashboard \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Wait for dev services to stabilize
+        run: |
+          echo "Waiting for all dev services to become stable..."
+          for SERVICE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+            echo "Waiting for $SERVICE..."
+            aws ecs wait services-stable \
+              --cluster renewable-energy-dev \
+              --services "$SERVICE" \
+              --region "${{ env.AWS_REGION }}"
+            echo "$SERVICE is stable."
+          done
+          echo "All dev services are stable."
+
+      - name: Verify dev deployment
+        run: |
+          for SERVICE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+            STATUS=$(aws ecs describe-services \
+              --cluster renewable-energy-dev \
+              --services "$SERVICE" \
+              --region "${{ env.AWS_REGION }}" \
+              --query 'services[0].status' \
+              --output text)
+            echo "$SERVICE status: $STATUS"
+            if [ "$STATUS" != "ACTIVE" ]; then
+              echo "ERROR: $SERVICE is not ACTIVE"
+              exit 1
+            fi
+          done
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment:
+      name: staging
+      url: http://renewable-energy-staging.example.com
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy all services to staging
+        run: |
+          for SERVICE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+            echo "Deploying $SERVICE to staging..."
+            aws ecs update-service \
+              --cluster renewable-energy-staging \
+              --service "$SERVICE" \
+              --force-new-deployment \
+              --region "${{ env.AWS_REGION }}"
+            echo "$SERVICE deployment initiated."
+          done
+
+      - name: Wait for staging services to stabilize
+        run: |
+          echo "Waiting for all staging services to become stable..."
+          for SERVICE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+            echo "Waiting for $SERVICE..."
+            aws ecs wait services-stable \
+              --cluster renewable-energy-staging \
+              --services "$SERVICE" \
+              --region "${{ env.AWS_REGION }}"
+            echo "$SERVICE is stable."
+          done
+          echo "All staging services are stable."
+
+      - name: Run staging smoke tests
+        run: |
+          ASSET_URL="http://renewable-energy-staging.example.com:5001"
+          TELEMETRY_URL="http://renewable-energy-staging.example.com:5002"
+          ANOMALY_URL="http://renewable-energy-staging.example.com:5003"
+          ALERT_URL="http://renewable-energy-staging.example.com:5004"
+
+          echo "Running smoke tests against staging..."
+
+          for URL_PAIR in "$ASSET_URL/health" "$TELEMETRY_URL/health" "$ANOMALY_URL/health" "$ALERT_URL/health"; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$URL_PAIR")
+            if [ "$RESPONSE" != "200" ]; then
+              echo "FAIL: $URL_PAIR returned HTTP $RESPONSE"
+              exit 1
+            fi
+            echo "PASS: $URL_PAIR"
+          done
+
+  notify:
+    name: Notify deployment
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-dev
+      - deploy-staging
+    if: always()
+    steps:
+      - name: Build notification payload
+        id: payload
+        run: |
+          STATUS="success"
+          if [ "${{ needs.deploy-dev.result }}" != "success" ] || [ "${{ needs.deploy-staging.result }}" != "success" ]; then
+            STATUS="failure"
+          fi
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          COLOR="#36a64f"
+          if [ "$STATUS" = "failure" ]; then
+            COLOR="#ff0000"
+          fi
+          echo "color=$COLOR" >> "$GITHUB_OUTPUT"
+
+      - name: Post deployment summary to Slack
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.payload.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Renewable Energy Platform - Deployment ${{ steps.payload.outputs.status == 'success' && 'Succeeded' || 'Failed' }}"
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Repository:*\n${{ github.repository }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Branch:*\n${{ github.ref_name }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit:*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Triggered by:*\n${{ github.actor }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Dev Deploy:*\n${{ needs.deploy-dev.result }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Staging Deploy:*\n${{ needs.deploy-staging.result }}"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Workflow Run"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

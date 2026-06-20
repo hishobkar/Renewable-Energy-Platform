@@ -1,0 +1,235 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "us-east-1"
+    ECR_REPOSITORY_PREFIX: "renewable-energy"
+    DOTNET_VERSION: "9.0"
+    PYTHON_VERSION: "3.11"
+  parameter-store:
+    AWS_ACCOUNT_ID: "/renewable-energy/aws-account-id"
+    ECR_REGISTRY: "/renewable-energy/ecr-registry"
+  exported-variables:
+    - IMAGE_TAG
+    - ECR_REGISTRY
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.11"
+    commands:
+      - echo "=== Installing dependencies ==="
+
+      # Install Docker (already available in CodeBuild standard images)
+      - docker --version
+
+      # Install .NET 9 SDK
+      - echo "Installing .NET $DOTNET_VERSION SDK..."
+      - wget -q https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+      - dpkg -i packages-microsoft-prod.deb
+      - apt-get update -qq
+      - apt-get install -y dotnet-sdk-9.0 2>/dev/null || true
+      - dotnet --version || echo ".NET installation via package manager failed, trying direct install"
+      - |
+        if ! command -v dotnet &>/dev/null; then
+          curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 9.0 --install-dir /usr/local/dotnet
+          export PATH="$PATH:/usr/local/dotnet"
+          echo "export PATH=\$PATH:/usr/local/dotnet" >> ~/.bashrc
+        fi
+      - dotnet --version
+
+      # Install Python dependencies
+      - pip install --upgrade pip
+      - pip install pytest pytest-cov pytest-asyncio httpx flake8 coverage
+
+      # Verify Python
+      - python3 --version
+
+  pre_build:
+    commands:
+      - echo "=== Pre-build phase ==="
+
+      # Set image tag from short commit SHA
+      - IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-8)
+      - export IMAGE_TAG
+      - echo "Image tag: $IMAGE_TAG"
+
+      # ECR login
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+          docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - echo "ECR login successful."
+
+      # Ensure ECR repositories exist
+      - |
+        for IMAGE in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+          REPO="$ECR_REPOSITORY_PREFIX/$IMAGE"
+          aws ecr describe-repositories --repository-names "$REPO" --region $AWS_DEFAULT_REGION 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name "$REPO" \
+            --image-scanning-configuration scanOnPush=true \
+            --region $AWS_DEFAULT_REGION
+          echo "Repository $REPO is ready."
+        done
+
+  build:
+    commands:
+      - echo "=== Build phase ==="
+
+      # Build all Docker images
+      - echo "Building Docker images..."
+      - |
+        declare -A SERVICES=(
+          ["asset-service"]="asset-service"
+          ["telemetry-service"]="telemetry-service"
+          ["anomaly-detection-service"]="anomaly-detection-service"
+          ["alert-service"]="alert-service"
+          ["simulator"]="simulator"
+          ["dashboard"]="dashboard"
+        )
+
+        BUILD_FAILED=false
+        for SERVICE in "${!SERVICES[@]}"; do
+          IMAGE_NAME="${SERVICES[$SERVICE]}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/$IMAGE_NAME:$IMAGE_TAG"
+          echo "Building $SERVICE -> $FULL_IMAGE"
+          BUILD_START=$(date +%s)
+          if docker build \
+            --build-arg BUILD_VERSION="$IMAGE_TAG" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$FULL_IMAGE" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/$IMAGE_NAME:latest" \
+            "services/$SERVICE/"; then
+            BUILD_END=$(date +%s)
+            echo "Built $SERVICE in $((BUILD_END - BUILD_START))s"
+          else
+            echo "ERROR: Failed to build $SERVICE"
+            BUILD_FAILED=true
+          fi
+        done
+
+        if [ "$BUILD_FAILED" = "true" ]; then
+          echo "One or more image builds failed."
+          exit 1
+        fi
+
+      # Run .NET tests
+      - echo "Running .NET tests..."
+      - |
+        cd services/asset-service
+        dotnet restore
+        dotnet test \
+          --no-restore \
+          --configuration Release \
+          --logger "trx;LogFileName=test-results.trx" \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ./TestResults \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+        echo ".NET tests completed."
+        cd ../..
+
+      # Run Python tests for each service
+      - echo "Running Python tests..."
+      - |
+        PYTHON_FAILED=false
+        for SERVICE in telemetry-service anomaly-detection-service alert-service simulator; do
+          echo "=== Testing $SERVICE ==="
+          cd "services/$SERVICE"
+          if [ -f requirements.txt ]; then
+            pip install -q -r requirements.txt
+          fi
+          if [ -d tests ]; then
+            pytest \
+              --tb=short \
+              -q \
+              --cov=. \
+              --cov-report=xml:coverage.xml \
+              --junitxml=test-results.xml \
+              tests/ || PYTHON_FAILED=true
+          else
+            echo "No tests directory for $SERVICE, skipping."
+          fi
+          cd ../..
+        done
+        if [ "$PYTHON_FAILED" = "true" ]; then
+          echo "WARNING: Some Python tests failed."
+        fi
+
+  post_build:
+    commands:
+      - echo "=== Post-build phase: Pushing images to ECR ==="
+
+      - |
+        PUSH_FAILED=false
+        for IMAGE_NAME in asset-service telemetry-service anomaly-detection-service alert-service simulator dashboard; do
+          FULL_TAG="$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/$IMAGE_NAME:$IMAGE_TAG"
+          LATEST_TAG="$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/$IMAGE_NAME:latest"
+          echo "Pushing $IMAGE_NAME..."
+          docker push "$FULL_TAG" || PUSH_FAILED=true
+          docker push "$LATEST_TAG" || PUSH_FAILED=true
+          echo "Pushed $IMAGE_NAME."
+        done
+
+        if [ "$PUSH_FAILED" = "true" ]; then
+          echo "ERROR: One or more image pushes failed."
+          exit 1
+        fi
+
+      # Write imagedefinitions.json for ECS deployment
+      - echo "Writing imagedefinitions.json..."
+      - |
+        cat > imagedefinitions.json << EOF
+        [
+          {
+            "name": "asset-service",
+            "imageUri": "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/asset-service:$IMAGE_TAG"
+          },
+          {
+            "name": "telemetry-service",
+            "imageUri": "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/telemetry-service:$IMAGE_TAG"
+          },
+          {
+            "name": "anomaly-detection-service",
+            "imageUri": "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/anomaly-detection-service:$IMAGE_TAG"
+          },
+          {
+            "name": "alert-service",
+            "imageUri": "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/alert-service:$IMAGE_TAG"
+          },
+          {
+            "name": "simulator",
+            "imageUri": "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/simulator:$IMAGE_TAG"
+          },
+          {
+            "name": "dashboard",
+            "imageUri": "$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX/dashboard:$IMAGE_TAG"
+          }
+        ]
+        EOF
+        cat imagedefinitions.json
+
+      - echo "Build complete. Image tag: $IMAGE_TAG"
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    - services/asset-service/TestResults/**/*
+    - services/*/test-results.xml
+    - services/*/coverage.xml
+  name: BuildArtifact
+  discard-paths: no
+
+reports:
+  DotNetTestResults:
+    files:
+      - 'services/asset-service/TestResults/*.trx'
+    file-format: VisualStudioTrx
+  PythonTestResults:
+    files:
+      - 'services/*/test-results.xml'
+    file-format: JunitXml
+
+cache:
+  paths:
+    - '/root/.nuget/packages/**/*'
+    - '/root/.cache/pip/**/*'

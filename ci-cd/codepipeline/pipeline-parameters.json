@@ -1,0 +1,50 @@
+[
+  {
+    "ParameterKey": "GitHubOwner",
+    "ParameterValue": "Hishobkar"
+  },
+  {
+    "ParameterKey": "GitHubRepo",
+    "ParameterValue": "Renewable-Energy-Platform"
+  },
+  {
+    "ParameterKey": "GitHubBranch",
+    "ParameterValue": "main"
+  },
+  {
+    "ParameterKey": "CodeStarConnectionArn",
+    "ParameterValue": "arn:aws:codestar-connections:us-east-1:123456789012:connection/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  },
+  {
+    "ParameterKey": "EcrRepositoryPrefix",
+    "ParameterValue": "renewable-energy"
+  },
+  {
+    "ParameterKey": "EcsClusterDev",
+    "ParameterValue": "renewable-energy-dev"
+  },
+  {
+    "ParameterKey": "EcsClusterStaging",
+    "ParameterValue": "renewable-energy-staging"
+  },
+  {
+    "ParameterKey": "EcsClusterProd",
+    "ParameterValue": "renewable-energy-prod"
+  },
+  {
+    "ParameterKey": "ArtifactBucketName",
+    "ParameterValue": "renewable-energy-pipeline-artifacts-123456789012"
+  },
+  {
+    "ParameterKey": "NotificationEmail",
+    "ParameterValue": "abhishobkar@gmail.com"
+  },
+  {
+    "ParameterKey": "SonarCloudToken",
+    "ParameterValue": "{{resolve:secretsmanager:renewable-energy/sonar-token:SecretString:token}}"
+  },
+  {
+    "ParameterKey": "EnvironmentName",
+    "ParameterValue": "production"
+  }
+]

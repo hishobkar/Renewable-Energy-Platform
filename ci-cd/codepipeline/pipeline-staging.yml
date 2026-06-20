@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Staging CodePipeline for the Renewable Energy Platform.
+  Triggers from release/* branches. Includes SonarQube scan, Trivy scan,
+  integration tests, manual approval, staging deploy, and smoke tests.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner/org
+  GitHubRepo:
+    Type: String
+    Default: Renewable-Energy-Platform
+  CodeStarConnectionArn:
+    Type: String
+    Description: ARN of the CodeStar Connection to GitHub
+  EcrRepositoryPrefix:
+    Type: String
+    Default: renewable-energy
+  EcsClusterStaging:
+    Type: String
+    Default: renewable-energy-staging
+  ArtifactBucketName:
+    Type: String
+  NotificationEmail:
+    Type: String
+  SonarCloudToken:
+    Type: String
+    NoEcho: true
+  SonarHostUrl:
+    Type: String
+    Default: 'https://sonarcloud.io'
+  SonarProjectKey:
+    Type: String
+    Default: 'renewable-energy-platform'
+  SonarOrganization:
+    Type: String
+
+Resources:
+
+  StagingArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ArtifactBucketName}-staging'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireStagingArtifacts
+            Status: Enabled
+            ExpirationInDays: 60
+
+  StagingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: renewable-energy-staging-pipeline-notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # ─── CodeBuild Projects ──────────────────────────────────────────────────
+
+  StagingCodeBuildBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-staging-build
+      ServiceRole: !GetAtt StagingCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          - Name: ECR_REPOSITORY_PREFIX
+            Value: !Ref EcrRepositoryPrefix
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec.yml
+      TimeoutInMinutes: 60
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+
+  StagingCodeBuildSonar:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-staging-sonar
+      Description: SonarCloud quality gate for staging
+      ServiceRole: !GetAtt StagingCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SONAR_TOKEN
+            Value: !Ref SonarCloudToken
+            Type: PLAINTEXT
+          - Name: SONAR_HOST_URL
+            Value: !Ref SonarHostUrl
+          - Name: SONAR_PROJECT_KEY
+            Value: !Ref SonarProjectKey
+          - Name: SONAR_ORGANIZATION
+            Value: !Ref SonarOrganization
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-sonar.yml
+      TimeoutInMinutes: 45
+
+  StagingCodeBuildSecurity:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-staging-security
+      Description: Trivy and security scan for staging
+      ServiceRole: !GetAtt StagingCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-security.yml
+      TimeoutInMinutes: 30
+
+  StagingCodeBuildIntegrationTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-staging-integration-test
+      Description: Integration tests against staging infrastructure
+      ServiceRole: !GetAtt StagingCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: ASSET_URL
+            Value: 'http://renewable-energy-staging.example.com:5001'
+          - Name: TELEMETRY_URL
+            Value: 'http://renewable-energy-staging.example.com:5002'
+          - Name: ANOMALY_URL
+            Value: 'http://renewable-energy-staging.example.com:5003'
+          - Name: ALERT_URL
+            Value: 'http://renewable-energy-staging.example.com:5004'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-test.yml
+      TimeoutInMinutes: 30
+
+  StagingCodeBuildDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-staging-deploy
+      Description: Deploy to staging ECS cluster
+      ServiceRole: !GetAtt StagingCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECS_CLUSTER
+            Value: !Ref EcsClusterStaging
+          - Name: ECR_REGISTRY
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci-cd/codebuild/buildspec-deploy.yml
+      TimeoutInMinutes: 30
+
+  StagingCodeBuildSmokeTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: renewable-energy-staging-smoke-test
+      Description: Post-deploy smoke tests for staging
+      ServiceRole: !GetAtt StagingCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: ASSET_SERVICE_URL
+            Value: 'http://renewable-energy-staging.example.com:5001'
+          - Name: TELEMETRY_SERVICE_URL
+            Value: 'http://renewable-energy-staging.example.com:5002'
+          - Name: ANOMALY_SERVICE_URL
+            Value: 'http://renewable-energy-staging.example.com:5003'
+          - Name: ALERT_SERVICE_URL
+            Value: 'http://renewable-energy-staging.example.com:5004'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - apt-get update -qq && apt-get install -y curl jq 2>/dev/null || true
+            build:
+              commands:
+                - echo "Running smoke tests for staging..."
+                - bash ci-cd/scripts/smoke-test.sh staging
+          artifacts:
+            files:
+              - smoke-test-results.json
+      TimeoutInMinutes: 15
+
+  # ─── Staging Pipeline ────────────────────────────────────────────────────
+  StagingPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: renewable-energy-staging-pipeline
+      RoleArn: !GetAtt StagingCodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref StagingArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: 'release/*'
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: BuildImages
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref StagingCodeBuildBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+        - Name: QualityGate
+          Actions:
+            - Name: SonarQubeScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref StagingCodeBuildSonar
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SonarArtifact
+              RunOrder: 1
+            - Name: TrivySecurityScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref StagingCodeBuildSecurity
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SecurityArtifact
+              RunOrder: 1
+
+        - Name: IntegrationTest
+          Actions:
+            - Name: RunIntegrationTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref StagingCodeBuildIntegrationTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: IntegrationTestArtifact
+              RunOrder: 1
+
+        - Name: Approval
+          Actions:
+            - Name: ApproveDeployToStaging
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref StagingNotificationTopic
+                CustomData: >
+                  SonarQube, security scan, and integration tests have passed.
+                  Please review and approve deployment to staging.
+                ExternalEntityLink: !Sub 'https://sonarcloud.io/project/overview?id=${SonarProjectKey}'
+              RunOrder: 1
+
+        - Name: Deploy-Staging
+          Actions:
+            - Name: DeployToStaging
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref StagingCodeBuildDeploy
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: StagingDeployArtifact
+              RunOrder: 1
+
+        - Name: SmokeTests
+          Actions:
+            - Name: RunSmokeTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref StagingCodeBuildSmokeTest
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: SmokeTestArtifact
+              RunOrder: 1
+
+      Tags:
+        - Key: Environment
+          Value: staging
+        - Key: Project
+          Value: renewable-energy-platform
+
+  # ─── IAM Roles ──────────────────────────────────────────────────────────
+  StagingCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-staging-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StagingCodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:GetBucketVersioning'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-staging'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-staging/*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource:
+                  - !GetAtt StagingCodeBuildBuild.Arn
+                  - !GetAtt StagingCodeBuildSonar.Arn
+                  - !GetAtt StagingCodeBuildSecurity.Arn
+                  - !GetAtt StagingCodeBuildIntegrationTest.Arn
+                  - !GetAtt StagingCodeBuildDeploy.Arn
+                  - !GetAtt StagingCodeBuildSmokeTest.Arn
+              - Effect: Allow
+                Action: 'codestar-connections:UseConnection'
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref StagingNotificationTopic
+
+  StagingCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: renewable-energy-staging-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: StagingCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-staging'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}-staging/*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:RegisterTaskDefinition'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'ecs-tasks.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/renewable-energy/*'
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:renewable-energy/*'
+
+Outputs:
+  StagingPipelineName:
+    Value: !Ref StagingPipeline
+  StagingNotificationTopicArn:
+    Value: !Ref StagingNotificationTopic
